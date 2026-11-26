@@ -1201,6 +1201,10 @@ pub(crate) struct HostList {
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    /// Host copies a list read, by title texture and generation. Repeated
+    /// reads of an unchanged texture borrow this list-local copy without
+    /// contending on the shared resource lock.
+    read_copies: Mutex<ReadCopies>,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
@@ -1268,6 +1272,13 @@ type States = std::collections::HashMap<
     usize,
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
+
+#[derive(Default)]
+struct ReadCopies {
+    by_texture:
+        std::collections::HashMap<usize, (u64, std::sync::Arc<crate::resource::HostTexture>)>,
+    before: Vec<std::sync::Arc<crate::resource::HostTexture>>,
+}
 
 /// What a list does with a depth texture that has a colour twin
 /// ([`crate::resource::Twin`]). Lists are recorded on many threads and run
@@ -4096,6 +4107,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
+                read_copies: Mutex::default(),
                 prelude,
                 pipelines,
                 #[cfg(feature = "diagnostics")]
@@ -6261,6 +6273,7 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *self.read_copies.lock().unwrap_or_else(|e| e.into_inner()) = ReadCopies::default();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6315,6 +6328,44 @@ impl HostList {
         let texture: &'static ID3D12Resource = unsafe { &*std::ptr::from_ref(&copy.texture) };
         self.transition_held(&copy, wanted)
             .map(|(before, _)| (texture, before))
+    }
+
+    /// Calls `f` with this title texture's current host copy, reusing the
+    /// list's own copy while its generation is unchanged. The copy stays
+    /// alive until reset, after the list's last submission has finished.
+    /// A nested use falls back to the shared lookup rather than deadlocking
+    /// on the list-local cache lock.
+    pub(crate) fn with_host_copy<R>(
+        &self,
+        resource: crate::object::This,
+        f: impl FnOnce(&std::sync::Arc<crate::resource::HostTexture>) -> R,
+    ) -> Option<R> {
+        let mut copies = match self.read_copies.try_lock() {
+            Ok(copies) => copies,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return crate::resource::host_copy(resource).map(|copy| f(&copy));
+            }
+        };
+        let generation = crate::resource::host_generation(resource);
+        if let Some((seen, copy)) = copies.by_texture.get(&(resource as usize))
+            && *seen == generation
+        {
+            return Some(f(copy));
+        }
+        let (generation, copy) = crate::resource::host_copy_at(resource)?;
+        let ReadCopies { by_texture, before } = &mut *copies;
+        let copy = match by_texture.entry(resource as usize) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let (_, old_copy) = entry.insert((generation, copy));
+                before.push(old_copy);
+                &entry.into_mut().1
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                &entry.insert((generation, copy)).1
+            }
+        };
+        Some(f(copy))
     }
 
     /// [`HostList::transition`] when the caller already holds the host copy.
