@@ -6,7 +6,8 @@
 # -Quality         fewer stretched/jumping bodies and less rainbow skin, at about 13 fps instead of about 20
 # -RecordPipelines record used pipelines for an offline warm-up on later launches
 # -WarmUsedPipelines warm recorded pipelines before launch and keep recording this run
-# -PrecompileShaders  translate/cache shaders from configured game and test-title folders before launch
+# -SkipShaderPrecompile skip the shader translation cache warm-up before launch
+# -SkipPipelineWarmup skip compiling pipelines recorded by earlier runs
 # -RayTracing      keep the title's ray-tracing passes (off by default: see below)
 # -Resolution      the height the game renders at before the title's own upscaler: 2160, 1440, 1080, 720, 540 or 480.
 #                  Series S outputs 1080p (so up to 1080 there), Series X 2160p. Default: half the output (540 on S,
@@ -24,7 +25,8 @@ param(
     [switch]$NoSmoothMotion,
     [switch]$RecordPipelines,
     [switch]$WarmUsedPipelines,
-    [switch]$PrecompileShaders,
+    [switch]$SkipShaderPrecompile,
+    [switch]$SkipPipelineWarmup,
     [switch]$SeriesX,
     [switch]$Quality,
     [switch]$RayTracing,
@@ -77,8 +79,9 @@ $rtList = Join-Path $PSScriptRoot 'rt_off_hashes.txt'
 if (-not $RayTracing -and (Test-Path $rtList)) {
     $settings.VICTORY_SKIP_PIPELINES = (Get-Content $rtList -Raw).Trim()
 }
-if ($RecordPipelines -or $WarmUsedPipelines) {
-    # Record pipelines used in this run so `victory warm --used` can compile them before the next launch.
+$warmPipelines = (-not $SkipPipelineWarmup) -or $WarmUsedPipelines
+if ($RecordPipelines -or $warmPipelines) {
+    # Record pipelines used in this run so the next launch can compile them first.
     $settings.VICTORY_PIPELINE_BOOK = '1'
 }
 if ($Quality) {
@@ -134,13 +137,14 @@ $runArgs = @('run', $Exe, '--execute')
 if (-not $SeriesX) { $runArgs += @('--console', 'series-s') }
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try {
-    if ($PrecompileShaders) {
+    if (-not $SkipShaderPrecompile) {
         # The translator cache lives outside the repository. This may take several minutes
         # the first time; later runs reuse cached translations while scanning the same files.
+        Write-Host 'Precompiling game shaders into the persistent shader cache before launch...'
         & $victory shaders
         if ($LASTEXITCODE -ne 0) { throw "Shader precompile failed with exit code $LASTEXITCODE" }
     }
-    if ($WarmUsedPipelines) {
+    if ($warmPipelines) {
         & $victory warm --used
         if ($LASTEXITCODE -ne 0) { throw "Pipeline warm-up failed with exit code $LASTEXITCODE" }
     }
