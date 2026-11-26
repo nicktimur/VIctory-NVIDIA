@@ -4258,22 +4258,6 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
-            let copy = crate::resource::host_copy(*resource as This);
-            if !aliased
-                && let Some(t) = copy.as_deref()
-                && t.flags() & 0x7 == 0
-            {
-                // (A texture the title writes: no target, depth or unordered
-                // access, `crate::texture::title_written`.)
-                // Of a texture the title placed, the levels the view shows.
-                let first = match (&placed, view) {
-                    (Some(_), View::Shader(_, Some(desc))) => crate::resource::first_mip(desc),
-                    _ => 0,
-                };
-                crate::texture::upload_from_copy(list, *resource as This, t, first);
-            }
-            // A depth texture shaders also write: what they wrote, first.
-            list.twin_use(*resource as This, false, false);
             // The depth target the draw only tests is read in both ways at
             // once: both read states, which its preparation asks for too.
             let (tested, _) = TESTED_DEPTH.get();
@@ -4283,9 +4267,19 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             } else {
                 SHADER_RESOURCE
             };
-            if let Some(copy) = copy {
-                crate::list::ensure_held_state(list, &copy, state);
-            }
+            list.with_host_copy(*resource as This, |copy| {
+                if !aliased && copy.flags() & 0x7 == 0 {
+                    // Of a placed texture, upload the levels its view shows.
+                    let first = match (&placed, view) {
+                        (Some(_), View::Shader(_, Some(desc))) => crate::resource::first_mip(desc),
+                        _ => 0,
+                    };
+                    crate::texture::upload_from_copy(list, *resource as This, copy, first);
+                }
+                // A depth texture shaders also write: what they wrote, first.
+                list.twin_use(*resource as This, false, false);
+                crate::list::ensure_held_state(list, copy, state);
+            });
             #[cfg(feature = "diagnostics")]
             if tracing::enabled!(tracing::Level::DEBUG)
                 && let Some(t) = crate::resource::host_resource(*resource as This)
