@@ -43,6 +43,8 @@ $settings = @{
     VICTORY_SUBMIT_FRAMES = '2'
     VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'
+    # Large streamed textures take card memory mip by mip; avoids reserving full chains before they arrive.
+    VICTORY_LEVELS_ON_DEMAND = '1'
     # During world loading, map pages side by side while mapping is the bottleneck; return to one caller when it is not.
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = 'auto'; VICTORY_TITLE_PRIORITIES = '1'; VICTORY_CARD_AWAKE = '1'
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'; VICTORY_SKIP_PIPELINES = 'none'
