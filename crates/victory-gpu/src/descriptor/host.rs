@@ -960,6 +960,9 @@ impl TextureQueue {
     ///   at waited 300 to 1,500 frames: faces whose textures are picked by
     ///   index read an empty slot (black) or an older view (red, noise).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        if max == 0 {
+            return Vec::new();
+        }
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
@@ -968,16 +971,44 @@ impl TextureQueue {
         }
         // By the number of the write, counted over the run.
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+        // Only `max` retries can be returned, even when tens of thousands
+        // are due. Partition first, then sort the bounded prefix.
+        if again.len() > max {
+            again.select_nth_unstable_by(max, newest_first);
+            again.truncate(max);
+        }
         again.sort_unstable_by(newest_first);
+        // Fresh writes alternate newest and oldest. Keep only the two ends
+        // that can appear in this pass, rather than sorting the whole
+        // backlog. The split preserves the same sequence as a full sort.
+        let take = fresh.len().min(max);
+        let newest = take.div_ceil(2);
+        let oldest = take / 2;
+        let mut old = if oldest != 0 {
+            let split = fresh.len() - oldest;
+            if split < fresh.len() {
+                fresh.select_nth_unstable_by(split, newest_first);
+            }
+            fresh.split_off(split)
+        } else {
+            Vec::new()
+        };
+        if fresh.len() > newest {
+            fresh.select_nth_unstable_by(newest, newest_first);
+            fresh.truncate(newest);
+        }
         fresh.sort_unstable_by(newest_first);
-        let mut fresh_order: Vec<(u32, u64)> = Vec::with_capacity(fresh.len().min(max));
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && fresh_order.len() < max {
-            fresh_order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && fresh_order.len() < max {
-                old -= 1;
-                fresh_order.push((fresh[old].1, fresh[old].2));
+        old.sort_unstable_by(newest_first);
+        let mut fresh_order: Vec<(u32, u64)> = Vec::with_capacity(take);
+        let (mut new, mut old_at) = (0, old.len());
+        while new < fresh.len() || old_at > 0 {
+            if new < fresh.len() {
+                fresh_order.push((fresh[new].1, fresh[new].2));
+                new += 1;
+            }
+            if old_at > 0 {
+                old_at -= 1;
+                fresh_order.push((old[old_at].1, old[old_at].2));
             }
         }
         let mut again_order = again.iter().map(|&(_, index, write)| (index, write));
