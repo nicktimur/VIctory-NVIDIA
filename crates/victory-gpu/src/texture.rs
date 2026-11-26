@@ -781,6 +781,18 @@ pub(crate) fn upload_from_copy(
     };
     use std::sync::atomic::Ordering::Relaxed;
     let picking = PICKING.get();
+    // A placed texture that cannot use on-demand tiles must wait until the
+    // selected levels are fully mapped. Uploading a snapshot with absent
+    // pages would turn the zero-filled holes into real texel data; the
+    // descriptor queue will retry it after the next mapping notification,
+    // while a regular draw asks again when it samples the resource.
+    if crate::resource::title_placed(resource)
+        && !staging.on_demand
+        && mapped_bytes(staging.memory, staging.read) < staging.read as u64
+    {
+        crate::descriptor::host::read_short(staging.memory as u64);
+        return;
+    }
     if picking.is_none() {
         // A draw samples it through a table: kept and checked from here on.
         staging.once.store(false, Relaxed);
