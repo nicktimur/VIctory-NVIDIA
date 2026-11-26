@@ -93,22 +93,24 @@ impl Upload {
             return Some(Upload(Kind::Heap(vec![0; len])));
         }
         let n = len.max(1).div_ceil(BLOCK);
-        let mut arenas = ARENAS.lock().unwrap_or_else(|e| e.into_inner());
-        let found = arenas.iter().enumerate().find_map(|(a, arena)| Some((a, gap(&arena.taken, n)?)));
-        let (a, first) = match found {
-            Some(place) => place,
-            None => {
-                let blocks = n.max(ARENA / BLOCK);
-                let at = reserve(blocks * BLOCK)?;
-                crate::shadow::register(at, at as u64, (blocks * BLOCK) as u64);
-                tracing::info!(at = format_args!("{at:#x}"), bytes = blocks * BLOCK, "memory for lists' uploads, where shaders reach it by address");
-                arenas.push(Arena { at, taken: vec![false; blocks] });
-                (arenas.len() - 1, 0)
-            }
+        let at = {
+            let mut arenas = ARENAS.lock().unwrap_or_else(|e| e.into_inner());
+            let found = arenas.iter().enumerate().find_map(|(a, arena)| Some((a, gap(&arena.taken, n)?)));
+            let (a, first) = match found {
+                Some(place) => place,
+                None => {
+                    let blocks = n.max(ARENA / BLOCK);
+                    let at = reserve(blocks * BLOCK)?;
+                    crate::shadow::register(at, at as u64, (blocks * BLOCK) as u64);
+                    tracing::info!(at = format_args!("{at:#x}"), bytes = blocks * BLOCK, "memory for lists' uploads, where shaders reach it by address");
+                    arenas.push(Arena { at, taken: vec![false; blocks] });
+                    (arenas.len() - 1, 0)
+                }
+            };
+            let arena = &mut arenas[a];
+            arena.taken[first..first + n].fill(true);
+            arena.at + first * BLOCK
         };
-        let arena = &mut arenas[a];
-        arena.taken[first..first + n].fill(true);
-        let at = arena.at + first * BLOCK;
         // SAFETY: the blocks are the arena's and nobody else's now.
         unsafe { std::ptr::write_bytes(at as *mut u8, 0, len) };
         Some(Upload(Kind::Low(at, len)))
@@ -176,3 +178,4 @@ mod tests {
         assert_eq!(gap(&[true, false, true, false, false, true], 3), None);
     }
 }
+
