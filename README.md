@@ -334,6 +334,15 @@ target\diag\victory.exe shaders <the shader archives>   # every shader translate
 target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
 ```
 
+To translate shaders before starting the game, pass `-PrecompileShaders` to
+`scripts\play-nvidia.ps1`. It scans the configured game and test-title folders
+and writes translations to the normal shader cache; the first pass can take
+several minutes, and later passes reuse cached translations. To also prepare
+GPU pipelines learned in previous sessions, use `-WarmUsedPipelines` (record
+them first with `-RecordPipelines`). Translation warm-up can cover shader
+programs found in files; complete D3D12 pipelines depend on runtime state and
+the current GPU driver, so those are warmed from pipelines recorded in a run.
+
 Commands, debugging switches and upstream's own description:
 [docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
 described in a comment where it is read.
@@ -379,3 +388,4 @@ commits taken from elsewhere name the commit and its author.
 
 GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is not
 covered is named in [docs/asset-policy.md](docs/asset-policy.md).
+
