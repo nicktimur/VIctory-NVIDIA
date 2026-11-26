@@ -4258,8 +4258,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+            let copy = crate::resource::host_copy(*resource as This);
             if !aliased
-                && let Some(t) = crate::resource::host_copy(*resource as This)
+                && let Some(t) = copy.as_deref()
                 && t.flags() & 0x7 == 0
             {
                 // (A texture the title writes: no target, depth or unordered
@@ -4269,7 +4270,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                     (Some(_), View::Shader(_, Some(desc))) => crate::resource::first_mip(desc),
                     _ => 0,
                 };
-                crate::texture::upload_from(list, *resource as This, first);
+                crate::texture::upload_from_copy(list, *resource as This, t, first);
             }
             // A depth texture shaders also write: what they wrote, first.
             list.twin_use(*resource as This, false, false);
@@ -4282,7 +4283,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             } else {
                 SHADER_RESOURCE
             };
-            crate::list::ensure_state(list, *resource as This, state);
+            if let Some(copy) = copy {
+                crate::list::ensure_held_state(list, &copy, state);
+            }
             #[cfg(feature = "diagnostics")]
             if tracing::enabled!(tracing::Level::DEBUG)
                 && let Some(t) = crate::resource::host_resource(*resource as This)
@@ -4577,3 +4580,4 @@ mod record_hash_tests {
         assert!(zeros.iter().all(|h| seen.insert(*h)));
     }
 }
+
