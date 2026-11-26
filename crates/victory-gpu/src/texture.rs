@@ -1696,7 +1696,7 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        if n == 0 || info.State != MEM_COMMIT {
+        if n == 0 || info.State != MEM_COMMIT || !readable_protection(info.Protect) {
             return false;
         }
         p = info.BaseAddress as usize + info.RegionSize;
@@ -1707,11 +1707,10 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
 /// How many bytes of `[at, at + len)` are committed memory: all of a
 /// texture that is there, some of one streaming in (its smaller mips lie
 /// at the start of its memory, and their pages are mapped first), none of
-/// one not there. With neither the first nor the last page committed the
-/// answer is none without a look at the pages between (two queries for the
-/// slots whose texture is away, which are asked again and again).
+/// one not there. When neither endpoint is committed, the sparse fallback
+/// walks virtual-memory regions so mapped middle mips are not mistaken for
+/// an absent texture.
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     if len == 0 {
         return 0;
     }
@@ -1727,8 +1726,13 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     {
         return there;
     }
-    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
-        return 0;
+    let endpoints = committed(at, 1) || committed((end - 1) as *const u8, 1);
+    if !endpoints {
+        // Textures normally stream from the first page, so keep the cheap
+        // page-table path for the common case. Some mappings are sparse:
+        // their endpoints are absent while a middle mip is already
+        // committed. Walk VM regions only in that case to find those bytes.
+        return mapped_bytes_by_query(start, end);
     }
     if !by_query() {
         static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1757,6 +1761,14 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         }
         return there;
     }
+    mapped_bytes_by_query(start, end)
+}
+
+/// Count readable committed bytes in `[start, end)` by virtual-memory
+/// region. Used for explicitly requested `VirtualQuery` accounting and for
+/// sparse textures whose first and last pages have not arrived.
+fn mapped_bytes_by_query(start: usize, end: usize) -> u64 {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     let (mut p, mut there) = (start, 0u64);
     while p < end {
         // SAFETY: plain data filled in by the query.
@@ -1767,12 +1779,21 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         if n == 0 || next <= p {
             break;
         }
-        if info.State == MEM_COMMIT {
+        if info.State == MEM_COMMIT && readable_protection(info.Protect) {
             there += (next - p) as u64;
         }
         p = next;
     }
     there
+}
+
+/// Whether a committed Windows page can be read without consuming a guard
+/// page. The low byte is the base protection; modifier flags are separate.
+fn readable_protection(protect: u32) -> bool {
+    const PAGE_GUARD: u32 = 0x100;
+    const PAGE_PROTECTION_MASK: u32 = 0xff;
+    const READABLE: [u32; 6] = [0x02, 0x04, 0x08, 0x20, 0x40, 0x80];
+    protect & PAGE_GUARD == 0 && READABLE.contains(&(protect & PAGE_PROTECTION_MASK))
 }
 
 /// The staging state of a title texture, made on first use.
