@@ -1146,6 +1146,10 @@ struct Resource {
     /// access, the colour texture shaders write instead ([`Twin`]).
     #[cfg(windows)]
     host: Hosted,
+    /// Changes with every write of the host copy, so a command list can
+    /// lend the copy it already holds without taking this resource's lock.
+    #[cfg(windows)]
+    host_generation: std::sync::atomic::AtomicU64,
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -1361,7 +1365,7 @@ pub(crate) fn want_level(this: This, first: u32) {
     crate::texture::unstage(this);
     r.host.grown.store(true, Relaxed);
     HELD[2].fetch_add(1, Relaxed);
-    if let Some(old) = made.take() {
+    if let Some(old) = r.set_host(&mut made, None) {
         REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((crate::host::moment(), old));
     }
 }
@@ -1521,6 +1525,13 @@ pub(crate) fn host_waits(this: This) -> bool {
 /// `make` says so. `None` for buffers and for textures the host refuses.
 #[cfg(windows)]
 fn hosted(this: This, make: bool) -> Option<Made> {
+    hosted_at(this, make).map(|(_, made)| made)
+}
+
+/// [`hosted`] and the generation that belongs to its result, under the
+/// same lock.
+#[cfg(windows)]
+fn hosted_at(this: This, make: bool) -> Option<(u64, Made)> {
     use std::sync::atomic::Ordering::Relaxed;
     let r = resource(this);
     if r.desc.dimension == BUFFER {
@@ -1627,7 +1638,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             KINDS[5].fetch_add(host.bytes, Relaxed);
         }
         KINDS[6].fetch_add(1, Relaxed);
-        *made = Some((std::sync::Arc::new(host), twin));
+        r.set_host(&mut made, Some((std::sync::Arc::new(host), twin)));
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
         crate::descriptor::texture_made(this as usize);
@@ -1636,7 +1647,20 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     if r.host.used.load(Relaxed) != now {
         r.host.used.store(now, Relaxed);
     }
-    made.clone()
+    Some((r.host_generation.load(Relaxed), made.clone()?))
+}
+
+#[cfg(windows)]
+impl Resource {
+    /// Writes the host copy while its lock is held and publishes a unique
+    /// generation after the new value is visible.
+    fn set_host(&self, slot: &mut Option<Made>, value: Option<Made>) -> Option<Made> {
+        use std::sync::atomic::Ordering;
+        let old = std::mem::replace(slot, value);
+        let generation = HOST_GENERATIONS.fetch_add(1, Ordering::Relaxed);
+        self.host_generation.store(generation, Ordering::Release);
+        old
+    }
 }
 
 /// The host copy of title texture `this` if it is made, without making it
@@ -2106,7 +2130,7 @@ pub(crate) fn let_go_idle() {
                 // state of the texture let go (it says "uploaded").
                 crate::texture::unstage(at as This);
                 r.host.wanted.store(u32::MAX, Relaxed);
-                made.take()
+                r.set_host(&mut made, None)
             } else {
                 None
             }
@@ -2387,6 +2411,32 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     }
     hosted(this, true).map(|made| made.0)
 }
+
+/// [`host_copy`] and the generation read under the same host-copy lock.
+#[cfg(windows)]
+pub(crate) fn host_copy_at(this: This) -> Option<(u64, std::sync::Arc<HostTexture>)> {
+    if this.is_null() {
+        return None;
+    }
+    let (generation, made) = hosted_at(this, true)?;
+    Some((generation, made.0))
+}
+
+/// The generation of this resource's host copy now, or zero before its
+/// first host copy is made.
+#[cfg(windows)]
+pub(crate) fn host_generation(this: This) -> u64 {
+    if this.is_null() {
+        return 0;
+    }
+    resource(this)
+        .host_generation
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[cfg(windows)]
+static HOST_GENERATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 
 /// A title texture's host copy if it is made; not made here.
 #[cfg(windows)]
@@ -2684,6 +2734,8 @@ fn hand_out_resource(
             wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
             grown: std::sync::atomic::AtomicBool::new(false),
         },
+        #[cfg(windows)]
+        host_generation: std::sync::atomic::AtomicU64::new(0),
     });
     // The host copy waits for the texture's first use ([`Hosted`]).
     #[cfg(windows)]
@@ -4569,3 +4621,4 @@ float4 lit() : SV_Target { return 1.0; }
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
     }
 }
+
