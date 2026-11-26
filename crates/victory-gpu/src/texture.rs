@@ -742,6 +742,19 @@ pub(crate) struct Digest(u128);
 /// texture the title placed there may be no memory of the larger ones, and
 /// what lies there is another texture's. (After victory-amd 4436f8f1.)
 pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
+    let Some(copy) = crate::resource::host_copy(resource) else {
+        return;
+    };
+    upload_from_copy(list, resource, &copy, first);
+}
+
+/// [`upload_from`] using the host copy already held by the caller.
+pub(crate) fn upload_from_copy(
+    list: &HostList,
+    resource: This,
+    copy: &crate::resource::HostTexture,
+    first: u32,
+) {
     let first = if crate::resource::held_only() { first } else { 0 };
     let host_written = HOST_WRITTEN
         .lock()
@@ -761,12 +774,9 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     if !list.first_use(resource as usize) && staged_from(resource) <= first {
         return;
     }
-    let Some(copy) = crate::resource::host_copy(resource) else {
-        return;
-    };
     let texture = &copy.texture;
-    ahead::listed(&copy);
-    let Some(staging) = staging(resource, &copy, first) else {
+    ahead::listed(copy);
+    let Some(staging) = staging(resource, copy, first) else {
         return;
     };
     use std::sync::atomic::Ordering::Relaxed;
