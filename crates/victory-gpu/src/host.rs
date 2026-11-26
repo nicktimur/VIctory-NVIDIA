@@ -1956,15 +1956,32 @@ impl<T> Spare<T> {
 fn scratch_spare_limit() -> u64 {
     const GIB: u64 = 1 << 30;
     const MIB: u64 = 1 << 20;
-    if !keep_freed() {
-        return SPARE_MOST;
+    use std::sync::atomic::AtomicU64;
+    static LIMIT: AtomicU64 = AtomicU64::new(SPARE_MOST);
+    static CHECKED: AtomicU64 = AtomicU64::new(0);
+
+    // Returning scratch chunks can happen many times in one frame. Sample
+    // Windows' RAM counters at most once a second, not on every list reset.
+    let now = now_ms();
+    let checked = CHECKED.load(Ordering::Relaxed);
+    if (checked == 0 || now.saturating_sub(checked) >= 1_000)
+        && CHECKED
+            .compare_exchange(checked, now.max(1), Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    {
+        let limit = if !keep_freed() {
+            SPARE_MOST
+        } else {
+            match available_physical_ram() {
+                Some(available) if available < 4 * GIB => SPARE_MOST,
+                Some(available) if available < 8 * GIB => 256 * MIB,
+                Some(available) if available < 12 * GIB => 512 * MIB,
+                Some(_) | None => SPARE_KEPT,
+            }
+        };
+        LIMIT.store(limit, Ordering::Relaxed);
     }
-    match available_physical_ram() {
-        Some(available) if available < 4 * GIB => SPARE_MOST,
-        Some(available) if available < 8 * GIB => 256 * MIB,
-        Some(available) if available < 12 * GIB => 512 * MIB,
-        Some(_) | None => SPARE_KEPT,
-    }
+    LIMIT.load(Ordering::Relaxed)
 }
 
 /// Scratch chunks no list holds.
