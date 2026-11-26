@@ -6,6 +6,7 @@
 # -Quality         fewer stretched/jumping bodies and less rainbow skin, at about 13 fps instead of about 20
 # -RecordPipelines record used pipelines for an offline warm-up on later launches
 # -WarmUsedPipelines warm recorded pipelines before launch and keep recording this run
+# -PrecompileShaders  translate/cache shaders from configured game and test-title folders before launch
 # -RayTracing      keep the title's ray-tracing passes (off by default: see below)
 # -Resolution      the height the game renders at before the title's own upscaler: 2160, 1440, 1080, 720, 540 or 480.
 #                  Series S outputs 1080p (so up to 1080 there), Series X 2160p. Default: half the output (540 on S,
@@ -23,6 +24,7 @@ param(
     [switch]$NoSmoothMotion,
     [switch]$RecordPipelines,
     [switch]$WarmUsedPipelines,
+    [switch]$PrecompileShaders,
     [switch]$SeriesX,
     [switch]$Quality,
     [switch]$RayTracing,
@@ -35,12 +37,12 @@ param(
 $settings = @{
     # This fork's play set (scripts\play.ps1, not -Safe): the speed set.
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_CARD_STEPS = '2'
+    # Keep one extra present in flight so the RTX can work through brief CPU submission gaps; adds input latency.
+    VICTORY_SUBMIT_FRAMES = '2'
     VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'
     # During world loading, map pages side by side while mapping is the bottleneck; return to one caller when it is not.
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = 'auto'; VICTORY_TITLE_PRIORITIES = '1'; VICTORY_CARD_AWAKE = '1'
-    # Requeue heap texture slots when DirectStorage writes their physical pages, so late data is not left stale.
-    VICTORY_PAGE_WRITES = '1'
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'; VICTORY_SKIP_PIPELINES = 'none'
     VICTORY_THIN = '1'; VICTORY_JOIN_PARTS = '8'; VICTORY_UPLOAD_AHEAD = '1'
     # Cheap picture fixes, on in both sets:
@@ -60,8 +62,9 @@ $settings = @{
     VICTORY_RENDER_SCALE = '0.5'; VICTORY_OWN_UPSCALER = '1'
     # Ray walks end at the root while the structure builder is off (emit/intersect.rs).
     VICTORY_BVH_MISS = '1'
-    # Keep 1 MiB+ buffer copies on the card, but cap them at 512 MiB so streamed textures retain VRAM room.
-    VICTORY_CARD_BUFFERS_MIN_MB = '1'; VICTORY_CARD_BUFFERS_MB = '512'
+    # Keep more small title buffers on the card: 64 KiB is the minimum; VRAM budget and this 1.5 GiB cap still apply.
+    # This shifts small-buffer comparison work from CPU memory toward the GPU without changing buffer contents.
+    VICTORY_CARD_BUFFERS_MIN_MB = '1'; VICTORY_CARD_BUFFERS_MIN_KB = '64'; VICTORY_CARD_BUFFERS_MB = '1536'
     # Series S presents the interface as a second plane: laid over the game (compose.rs), else black before gameplay.
     VICTORY_COMPOSE = '1'
 }
@@ -131,6 +134,12 @@ $runArgs = @('run', $Exe, '--execute')
 if (-not $SeriesX) { $runArgs += @('--console', 'series-s') }
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try {
+    if ($PrecompileShaders) {
+        # The translator cache lives outside the repository. This may take several minutes
+        # the first time; later runs reuse cached translations while scanning the same files.
+        & $victory shaders
+        if ($LASTEXITCODE -ne 0) { throw "Shader precompile failed with exit code $LASTEXITCODE" }
+    }
     if ($WarmUsedPipelines) {
         & $victory warm --used
         if ($LASTEXITCODE -ne 0) { throw "Pipeline warm-up failed with exit code $LASTEXITCODE" }
