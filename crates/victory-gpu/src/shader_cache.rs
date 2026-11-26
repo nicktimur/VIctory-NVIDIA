@@ -119,15 +119,15 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 
 /// The translation of a console shader container, from the cache when
 /// there is one.
-pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+pub(crate) fn host_shader(container: &[u8]) -> Result<(HostShader, bool), String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
-    let shader = match CACHE.get() {
+    let (shader, cache_hit) = match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
-        None => translate(container),
+        None => translate(container).map(|shader| (shader, false)),
     }?;
     #[cfg(feature = "diagnostics")]
     let shader = paired_override(container, shader);
-    Ok(shader)
+    Ok((shader, cache_hit))
 }
 
 /// Try cache entries made by the paired-wave translator for the 32-lane,
@@ -195,7 +195,7 @@ fn cached(
     build: &[u8; 32],
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
-) -> Result<HostShader, String> {
+) -> Result<(HostShader, bool), String> {
     let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
@@ -206,20 +206,21 @@ fn cached(
             .get_or_convert(&converter, &input)
             .map_err(|e| format!("{e:#}"))?;
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
-            let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
+            let cache_hit = !converter.ran.load(Ordering::Relaxed);
+            let (counter, what) = if !cache_hit {
                 (&MISSES, "translated and cached")
             } else {
                 (&HITS, "from the cache")
             };
             counter.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(path = %path.display(), "shader {what}");
-            return Ok(shader);
+            return Ok((shader, cache_hit));
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
         let _ = std::fs::remove_file(&path);
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
-    (converter.translate)(container)
+    (converter.translate)(container).map(|shader| (shader, false))
 }
 
 const MAGIC: &[u8; 4] = b"VSH1";
