@@ -2603,6 +2603,12 @@ pub(crate) fn host_tiled(this: This) -> Option<OnDemand> {
     hosted(this, false).map(|(host, _)| host).filter(|host| host.tiled.is_some()).map(OnDemand)
 }
 
+/// Whether the title's texture resource is backed by a placed memory range.
+#[cfg(windows)]
+pub(crate) fn title_placed(this: This) -> bool {
+    !this.is_null() && resource(this).host.placed.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The first level a view of title texture `this` may show, if its host
 /// copy is made level by level and some level is held and has memory
 /// (`crate::tiles::Tiled::first_shown`).
