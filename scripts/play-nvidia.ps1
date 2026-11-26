@@ -4,6 +4,8 @@
 #                  so a Smooth Motion profile set for that exe in the NVIDIA App applies every time.
 # -SeriesX         the Series X profile instead (slower: about 7 fps at half scale)
 # -Quality         fewer stretched/jumping bodies and less rainbow skin, at about 13 fps instead of about 20
+# -RecordPipelines record used pipelines for an offline warm-up on later launches
+# -WarmUsedPipelines warm recorded pipelines before launch and keep recording this run
 # -RayTracing      keep the title's ray-tracing passes (off by default: see below)
 # -Resolution      the height the game renders at before the title's own upscaler: 2160, 1440, 1080, 720, 540 or 480.
 #                  Series S outputs 1080p (so up to 1080 there), Series X 2160p. Default: half the output (540 on S,
@@ -70,7 +72,7 @@ $rtList = Join-Path $PSScriptRoot 'rt_off_hashes.txt'
 if (-not $RayTracing -and (Test-Path $rtList)) {
     $settings.VICTORY_SKIP_PIPELINES = (Get-Content $rtList -Raw).Trim()
 }
-if ($RecordPipelines) {
+if ($RecordPipelines -or $WarmUsedPipelines) {
     # Record pipelines used in this run so `victory warm --used` can compile them before the next launch.
     $settings.VICTORY_PIPELINE_BOOK = '1'
 }
