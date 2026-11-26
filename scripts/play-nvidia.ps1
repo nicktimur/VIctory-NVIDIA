@@ -5,7 +5,7 @@
 # -SeriesX         the Series X profile instead (slower: about 7 fps at half scale)
 # -Quality         fewer stretched/jumping bodies and less rainbow skin, at about 13 fps instead of about 20
 # -RecordPipelines record used pipelines for an offline warm-up on later launches
-# -WarmUsedPipelines warm recorded pipelines before launch and keep recording this run
+# -WarmUsedPipelines warm recorded pipelines before launch and keep recording this run (same as the default)
 # -SkipShaderPrecompile skip the shader translation cache warm-up before launch
 # -SkipPipelineWarmup skip compiling pipelines recorded by earlier runs
 # -RayTracing      keep the title's ray-tracing passes (off by default: see below)
@@ -145,7 +145,11 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "Shader precompile failed with exit code $LASTEXITCODE" }
     }
     if ($warmPipelines) {
-        & $victory warm --used
+        # Warm every pipeline observed in previous runs. The command resumes from its
+        # persistent done list and isolates slow/crashing driver compiles per process.
+        # This is deliberately a long offline pass: it avoids first-use PSO creation
+        # during gameplay, including pipelines not seen in the most recent session.
+        & $victory warm
         if ($LASTEXITCODE -ne 0) { throw "Pipeline warm-up failed with exit code $LASTEXITCODE" }
     }
     & $victory @runArgs
