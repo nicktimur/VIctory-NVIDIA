@@ -674,7 +674,7 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 /// its memory mapped; uploads of textures not all mapped; and of those,
 /// the ones whose first page was not there (asked by the first page alone,
 /// as before, they counted as not there at all).
-pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Marks the last traced draw as not run on the host.
@@ -2447,6 +2447,17 @@ impl State {
                 at_once();
                 // a render target, a depth or unordered access texture: the host's own
                 host.texture_slot_done(index, write, None);
+                continue;
+            }
+            // A regular placed texture needs all of the bytes its view
+            // describes. Copying a partial mapping also copies the zeroes
+            // read for absent pages into its unmapped mip levels; compressed
+            // formats can turn those holes into visibly corrupted surfaces.
+            // Large eligible textures use tiled on-demand levels instead,
+            // so they may safely expose the levels that have arrived.
+            if partly.is_some() && crate::resource::host_tiled(resource).is_none() {
+                HEAP_TEXTURES_PARTLY[3].fetch_add(1, Ordering::Relaxed);
+                host.texture_slot_later(index, write, frame, most);
                 continue;
             }
             // A texture that has a staging buffer now is one draws read
