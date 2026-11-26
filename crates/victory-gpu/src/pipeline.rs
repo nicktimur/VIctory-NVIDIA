@@ -127,6 +127,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 #[cfg(windows)]
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
+    /// Whether its translation was already in the disk cache.
+    pub(crate) cache_hit: bool,
     /// A compute program's threads in a group.
     pub(crate) threads: Option<[u32; 3]>,
     pub(crate) used: Vec<victory_shader::UsedResource>,
@@ -169,7 +171,8 @@ impl Shader {
                         hash = %self.hash,
                         user_data = t.host.user_data.len(),
                         samplers = t.host.samplers.len(),
-                        "shader translated"
+                        cache = if t.cache_hit { "hit" } else { "miss" },
+                        "shader ready"
                     ),
                     Err(e) => tracing::warn!(
                         stage = self.stage,
@@ -205,7 +208,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
+    let (host, cache_hit) = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let threads = programs.iter().find_map(|p| match &p.io {
         victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
@@ -224,6 +227,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         .unwrap_or_default();
     Ok(Translated {
         host,
+        cache_hit,
         threads,
         used,
         stores,
