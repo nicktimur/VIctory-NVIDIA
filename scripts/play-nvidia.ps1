@@ -35,8 +35,6 @@ param(
 $settings = @{
     # This fork's play set (scripts\play.ps1, not -Safe): the speed set.
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_CARD_STEPS = '2'
-    # Keep one extra present in flight so the RTX can work through brief CPU submission gaps; adds input latency.
-    VICTORY_SUBMIT_FRAMES = '2'
     VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'
     # During world loading, map pages side by side while mapping is the bottleneck; return to one caller when it is not.
