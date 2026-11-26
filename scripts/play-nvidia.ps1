@@ -60,9 +60,8 @@ $settings = @{
     VICTORY_RENDER_SCALE = '0.5'; VICTORY_OWN_UPSCALER = '1'
     # Ray walks end at the root while the structure builder is off (emit/intersect.rs).
     VICTORY_BVH_MISS = '1'
-    # Keep more small title buffers on the card: 64 KiB is the minimum; VRAM budget and this 1.5 GiB cap still apply.
-    # This shifts small-buffer comparison work from CPU memory toward the GPU without changing buffer contents.
-    VICTORY_CARD_BUFFERS_MIN_MB = '1'; VICTORY_CARD_BUFFERS_MIN_KB = '64'; VICTORY_CARD_BUFFERS_MB = '1536'
+    # Keep 1 MiB+ buffer copies on the card, but cap them at 512 MiB so streamed textures retain VRAM room.
+    VICTORY_CARD_BUFFERS_MIN_MB = '1'; VICTORY_CARD_BUFFERS_MB = '512'
     # Series S presents the interface as a second plane: laid over the game (compose.rs), else black before gameplay.
     VICTORY_COMPOSE = '1'
 }
