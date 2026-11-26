@@ -460,34 +460,73 @@ pub(crate) fn levels_waiting(start: u64) {
     WAITING.lock().unwrap_or_else(|e| e.into_inner()).insert(start, crate::host::moment());
 }
 
-/// Placed textures (by the start of their memory) filled while the runtime
-/// was remapping with less than was mapped of them
-/// (`crate::texture::fill_unlocked`), whose slots the next texture pass
-/// makes due again; and how often in a row that was, which ends it: memory
-/// that is shown and cannot be read would be uploaded again every frame.
-static SHORT: Mutex<(std::collections::BTreeSet<u64>, std::collections::BTreeMap<u64, u32>)> =
-    Mutex::new((std::collections::BTreeSet::new(), std::collections::BTreeMap::new()));
+/// A placed texture whose first upload found memory being remapped. Keep
+/// retrying its view after a short read, with a bounded backoff once the
+/// first quick retries are exhausted; a late mapping must not leave it
+/// permanently blurred just because several lists sampled it in one frame.
+#[derive(Clone, Copy)]
+struct ShortRead {
+    due: u64,
+    failures: u32,
+    tried: u64,
+}
 
-/// Fillings in a row of one texture that got less than was mapped, after
-/// which its slots wait for the next notice of its memory.
-const SHORT_IN_A_ROW: u32 = 8;
+const SHORT_WAITING: u64 = u64::MAX;
+static SHORT: Mutex<std::collections::BTreeMap<u64, ShortRead>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// Keep one-frame retries for the first failures, then back off to at most
+/// once every 64 frames while the memory remains incomplete.
+const SHORT_FAST_RETRIES: u32 = 8;
+
+fn short_failed(start: u64, frame: u64) {
+    let mut short = SHORT.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(state) = short.get_mut(&start) else {
+        short.insert(
+            start,
+            ShortRead { due: frame.saturating_add(1), failures: 1, tried: frame },
+        );
+        return;
+    };
+    // A texture may be refreshed by more than one list in a frame. Those
+    // reads are not independent retries and must not burn the retry budget.
+    if state.tried == frame {
+        return;
+    }
+    state.tried = frame;
+    if state.due == SHORT_WAITING {
+        state.failures = state.failures.saturating_add(1);
+        let shift = state.failures.saturating_sub(SHORT_FAST_RETRIES).min(6);
+        state.due = frame.saturating_add(1u64 << shift);
+    } else if state.due > frame.saturating_add(1) {
+        // A page remap/write event may have caused an early refresh.
+        state.due = frame.saturating_add(1);
+    }
+}
 
 /// The placed texture at `start` was filled with less than was mapped.
 pub(crate) fn read_short(start: u64) {
-    let mut short = SHORT.lock().unwrap_or_else(|e| e.into_inner());
-    let times = short.1.entry(start).or_insert(0);
-    *times += 1;
-    if *times <= SHORT_IN_A_ROW {
-        short.0.insert(start);
-    }
+    short_failed(start, crate::frame::current());
 }
 
 /// The placed texture at `start` was filled with all that was mapped.
 pub(crate) fn read_all(start: u64) {
+    SHORT.lock().unwrap_or_else(|e| e.into_inner()).remove(&start);
+}
+
+/// Starts due for another texture-table look; each is marked as in flight
+/// until the next short read schedules it again or a complete read clears it.
+fn short_due(frame: u64) -> Vec<u64> {
     let mut short = SHORT.lock().unwrap_or_else(|e| e.into_inner());
-    if !short.1.is_empty() {
-        short.1.remove(&start);
-    }
+    short
+        .iter_mut()
+        .filter_map(|(&start, state)| {
+            (state.due <= frame).then(|| {
+                state.due = SHORT_WAITING;
+                start
+            })
+        })
+        .collect()
 }
 
 /// Title memory by the placed texture views that describe it: per span of
@@ -1935,7 +1974,7 @@ impl HostHeap {
         if self.sampler {
             return 0;
         }
-        let starts = std::mem::take(&mut SHORT.lock().unwrap_or_else(|e| e.into_inner()).0);
+        let starts = short_due(frame);
         if starts.is_empty() {
             return 0;
         }
@@ -4820,24 +4859,26 @@ mod tests {
         assert_eq!(spans.slots_in(0x0, 0x10001), vec![1]);
     }
 
-    /// A texture filled with less than was mapped is looked at again, but
-    /// not for ever: memory that is shown and cannot be read ends it, and a
-    /// filling that got everything starts the count anew.
+    /// Short reads are retried once per frame at first, then with bounded
+    /// backoff; a complete read clears the retry state.
     #[test]
-    fn a_short_filling_is_looked_at_again_a_few_times() {
+    fn a_short_filling_keeps_a_bounded_retry_until_complete() {
         // An address no other test names.
         let start = 0x7fee_1234_0000u64;
-        let pending = || super::SHORT.lock().unwrap().0.remove(&start);
-        for _ in 0..super::SHORT_IN_A_ROW {
-            super::read_short(start);
-            assert!(pending());
+        let mut frame = 100;
+        super::short_failed(start, frame);
+        assert_eq!(super::short_due(frame + 1), vec![start]);
+        frame += 2; // the due slot is refreshed by the following frame
+        for _ in 2..=super::SHORT_FAST_RETRIES {
+            super::short_failed(start, frame);
+            assert_eq!(super::short_due(frame + 1), vec![start]);
+            frame += 2;
         }
-        super::read_short(start);
-        assert!(!pending());
+        super::short_failed(start, frame);
+        assert!(super::short_due(frame + 1).is_empty());
+        assert_eq!(super::short_due(frame + 2), vec![start]);
         super::read_all(start);
-        super::read_short(start);
-        assert!(pending());
-        super::read_all(start);
+        assert!(super::short_due(u64::MAX).is_empty());
     }
 
     /// The unsigned twin of a 16-bit float or signed format has its layout,
@@ -5967,3 +6008,4 @@ pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
 pub(crate) fn list_views() -> bool {
     crate::toggled!("VICTORY_LIST_VIEWS")
 }
+
