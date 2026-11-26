@@ -19,6 +19,8 @@
 param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$NoSmoothMotion,
+    [switch]$RecordPipelines,
+    [switch]$WarmUsedPipelines,
     [switch]$SeriesX,
     [switch]$Quality,
     [switch]$RayTracing,
@@ -67,6 +69,10 @@ $settings = @{
 $rtList = Join-Path $PSScriptRoot 'rt_off_hashes.txt'
 if (-not $RayTracing -and (Test-Path $rtList)) {
     $settings.VICTORY_SKIP_PIPELINES = (Get-Content $rtList -Raw).Trim()
+}
+if ($RecordPipelines) {
+    # Record pipelines used in this run so `victory warm --used` can compile them before the next launch.
+    $settings.VICTORY_PIPELINE_BOOK = '1'
 }
 if ($Quality) {
     # Stretched/jumping bodies: relay stage 1 and no card steps (avatarmanz/VIctory-7900XTX issue 13,
@@ -120,5 +126,11 @@ $Exe = (Resolve-Path $Exe).Path
 $runArgs = @('run', $Exe, '--execute')
 if (-not $SeriesX) { $runArgs += @('--console', 'series-s') }
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory @runArgs } finally { Pop-Location }
+try {
+    if ($WarmUsedPipelines) {
+        & $victory warm --used
+        if ($LASTEXITCODE -ne 0) { throw "Pipeline warm-up failed with exit code $LASTEXITCODE" }
+    }
+    & $victory @runArgs
+} finally { Pop-Location }
 
