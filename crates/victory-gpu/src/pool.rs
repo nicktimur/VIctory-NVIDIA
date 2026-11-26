@@ -37,18 +37,33 @@ const SPARE_KEPT: usize = 64;
 const STAGING_KEPT: usize = 8;
 /// How many are kept now.
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
+/// Empty upload blocks kept, by free system RAM rather than video memory.
+static STAGING_SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+    STAGING_SPARES.store(staging_spares(crate::host::available_physical_ram(), crate::host::keep_freed()), Ordering::Relaxed);
+    // Drop empty upload blocks promptly when the PC is under RAM pressure;
+    // they are system-memory caches and do not follow the VRAM budget.
+    lock(&STAGING).rested(now());
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     match memory {
         Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
         _ => SPARE,
+    }
+}
+
+fn staging_spares(available: Option<u64>, keep: bool) -> usize {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    if keep && available.is_some_and(|bytes| bytes >= 12 * GIB) {
+        STAGING_KEPT
+    } else {
+        SPARE
     }
 }
 
@@ -180,11 +195,13 @@ struct Pool<B> {
     /// The empty blocks it was last told to keep, and the most it keeps.
     spare: usize,
     most: usize,
+    /// Upload buffers consume system RAM; texture heaps consume VRAM.
+    system_memory: bool,
 }
 
 impl<B: Clone> Pool<B> {
-    const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most }
+    const fn new(most: usize, system_memory: bool) -> Pool<B> {
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, system_memory }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -283,7 +300,8 @@ impl<B: Clone> Pool<B> {
             }
         }
         // (Without a piece given back too, once there is less room.)
-        let most = SPARES.load(Ordering::Relaxed).min(self.most);
+        let target = if self.system_memory { &STAGING_SPARES } else { &SPARES };
+        let most = target.load(Ordering::Relaxed).min(self.most);
         if any || most < self.spare {
             self.spare = most;
             let mut spare = 0;
@@ -309,8 +327,8 @@ struct Upload(ID3D12Resource, *mut u8);
 // SAFETY: the mapping is written by the owners of its pieces, each its own.
 unsafe impl Send for Upload {}
 
-static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
-static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
+static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT, false));
+static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT, true));
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -668,3 +686,4 @@ mod tests {
         }
     }
 }
+
