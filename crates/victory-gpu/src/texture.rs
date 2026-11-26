@@ -1387,13 +1387,12 @@ impl Staging {
     }
 
     /// The first filling of the staging buffer while the runtime is
-    /// remapping title memory, of a texture not all of which can be read:
-    /// with the pages that are there, zeros for the others, as a partly
-    /// mapped texture is filled under the lock. Pages that are away only
-    /// for the moment of a change (the runtime unmaps the rest of a view to
-    /// change one page of it) are read when that change is over. If less
-    /// was read than was mapped when the upload was recorded, or is mapped
-    /// now, the texture's slots are looked at again.
+    /// remapping title memory, of a texture not all of which can be read.
+    /// A short read is not published: the existing staging contents stay
+    /// intact until a later read has all pages that were mapped when the
+    /// upload was recorded, or are mapped now. This avoids uploading a mix
+    /// of new data and zero-filled holes while the runtime temporarily
+    /// unmaps a view to replace one of its pages.
     fn fill(&self, last: &mut Last, size: usize) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let start = self.memory as u64;
@@ -1408,7 +1407,12 @@ impl Staging {
                 }
                 crate::watch::change_over();
             }
-            if got != 0 {
+            // `read_there` zero-fills pages that could not be read. Never
+            // detile that partial snapshot: it can contain unrelated zero
+            // mip levels and produce visibly corrupt textures. Keep the
+            // last complete staging image, or its initial placeholder, and
+            // let the short-read path below schedule another look.
+            if got >= there.max(self.expected.load(Relaxed)) {
                 last.hash = Some(digest(read));
                 self.detile(read);
             }
@@ -2255,3 +2259,4 @@ mod allocation_costs {
         }
     }
 }
+
