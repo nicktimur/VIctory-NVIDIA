@@ -1937,6 +1937,34 @@ impl<T> Spare<T> {
         self.kept.push((thing, size));
         None
     }
+
+    /// Drops the oldest idle chunks when the system-RAM allowance falls.
+    fn trim(&mut self, most: u64) -> Vec<T> {
+        let mut dropped = Vec::new();
+        while self.bytes > most {
+            let Some((thing, size)) = self.kept.pop() else { break };
+            self.bytes -= size;
+            dropped.push(thing);
+        }
+        dropped
+    }
+}
+
+/// Scratch memory is reused when RAM is available, then capped more tightly
+/// as the title and other processes consume system memory. A missing reading
+/// keeps the old high-memory allowance when `keep_freed` is enabled.
+fn scratch_spare_limit() -> u64 {
+    const GIB: u64 = 1 << 30;
+    const MIB: u64 = 1 << 20;
+    if !keep_freed() {
+        return SPARE_MOST;
+    }
+    match available_physical_ram() {
+        Some(available) if available < 4 * GIB => SPARE_MOST,
+        Some(available) if available < 8 * GIB => 256 * MIB,
+        Some(available) if available < 12 * GIB => 512 * MIB,
+        Some(_) | None => SPARE_KEPT,
+    }
 }
 
 /// Scratch chunks no list holds.
@@ -1971,10 +1999,12 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     }
     let mut freed = Vec::new();
     {
+        let spare_limit = scratch_spare_limit();
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        freed.extend(spare.trim(spare_limit));
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, if keep_freed() { SPARE_KEPT } else { SPARE_MOST })
+                spare.give(chunk, size, spare_limit)
             } else {
                 Some(chunk)
             };
