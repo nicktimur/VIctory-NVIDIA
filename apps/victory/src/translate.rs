@@ -403,6 +403,8 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
     let started = std::time::Instant::now();
     let seen = Mutex::new(HashSet::new());
     let done = AtomicUsize::new(0);
+    let cache_hits = AtomicUsize::new(0);
+    let translated = AtomicUsize::new(0);
     let failed = Mutex::new(BTreeMap::<String, (usize, String)>::new());
     for root in &paths {
         for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
@@ -424,10 +426,22 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
                                 continue;
                             }
                             match victory_hle::modules::d3d12x::precompile(&bytes) {
-                                Ok(_) => {
+                                Ok(was_cached) => {
+                                    if was_cached {
+                                        cache_hits.fetch_add(1, Ordering::Relaxed);
+                                    } else {
+                                        translated.fetch_add(1, Ordering::Relaxed);
+                                    }
                                     let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                                     if n.is_multiple_of(1000) {
-                                        println!("{n} shaders in the cache, {:.0} s", started.elapsed().as_secs_f64());
+                                        let elapsed = started.elapsed().as_secs_f64();
+                                        println!(
+                                            "{n} shaders prepared ({} cache hits, {} translated), {:.0} s, {:.1} shaders/s",
+                                            cache_hits.load(Ordering::Relaxed),
+                                            translated.load(Ordering::Relaxed),
+                                            elapsed,
+                                            n as f64 / elapsed.max(f64::EPSILON),
+                                        );
                                     }
                                 }
                                 Err(why) => {
@@ -443,8 +457,10 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
     }
     let failed = failed.into_inner().unwrap_or_else(|e| e.into_inner());
     println!(
-        "{} shaders in the cache, {} do not translate, {:.0} s",
+        "{} shaders prepared ({} cache hits, {} translated), {} do not translate, {:.0} s",
         done.load(Ordering::Relaxed),
+        cache_hits.load(Ordering::Relaxed),
+        translated.load(Ordering::Relaxed),
         failed.values().map(|f| f.0).sum::<usize>(),
         started.elapsed().as_secs_f64()
     );
