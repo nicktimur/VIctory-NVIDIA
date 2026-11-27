@@ -1689,10 +1689,19 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
     }
 }
 
+/// Admission ceiling for speculative copies, based on actual local usage.
+#[cfg(windows)]
+fn speculative_vram_full(memory: Option<[u64; 4]>, headroom: bool) -> bool {
+    let percent = if headroom { 90 } else { 100 };
+    memory.is_some_and(|[budget, used, ..]| {
+        budget != 0 && u128::from(used) * 100 >= u128::from(budget) * percent
+    })
+}
+
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
-/// up to [`texture_floor_bytes`] bytes of them while within the reported
-/// budget, beyond that while the card's
+/// up to [`texture_floor_bytes`] bytes of them below the local usage
+/// ceiling (90 percent in memory-headroom mode), beyond that while the card's
 /// memory in use by this process is under nine tenths of the budget the system
 /// gives it ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB`
 /// sets a limit on those copies' bytes instead). Past the budget the system moves the card's memory into the PC's,
@@ -1701,9 +1710,9 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     const WITHOUT_BUDGET: u64 = 4 << 30;
-    // A texture floor or an explicit texture-only limit must not admit new
-    // speculative copies when Windows already reports paging pressure.
-    if memory.is_some_and(|[budget, used, ..]| budget != 0 && used >= budget) {
+    // Apply the local usage ceiling before the texture floor, texture-only
+    // limit, or credit for unused space in pooled blocks.
+    if speculative_vram_full(memory, crate::host::memory_headroom()) {
         return false;
     }
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -4620,6 +4629,17 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn speculative_textures_leave_local_vram_headroom() {
+        assert!(!speculative_vram_full(Some([101, 90, 0, 0]), true));
+        assert!(speculative_vram_full(Some([101, 91, 0, 0]), true));
+        assert!(!speculative_vram_full(Some([101, 91, 0, 0]), false));
+        assert!(speculative_vram_full(Some([101, 101, 0, 0]), false));
+        assert!(!speculative_vram_full(Some([0, 100, 0, 0]), true));
+        assert!(!speculative_vram_full(None, true));
     }
 
     /// A placed texture viewed from a later level has a host copy of that
