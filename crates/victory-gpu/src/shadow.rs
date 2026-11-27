@@ -1014,8 +1014,13 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
 fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     skip.sort_unstable();
     let mut out = Vec::new();
+    outside_sorted(from, to, &skip, |a, b| out.push((a, b)));
+    out
+}
+
+fn outside_sorted(from: usize, to: usize, skip: &[(usize, usize)], mut emit: impl FnMut(usize, usize)) {
     let mut at = from;
-    for (a, b) in skip {
+    for &(a, b) in skip {
         if b <= at {
             continue;
         }
@@ -1023,14 +1028,13 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
             break;
         }
         if a > at {
-            out.push((at, a));
+            emit(at, a);
         }
         at = at.max(b);
     }
     if at < to {
-        out.push((at, to));
+        emit(at, to);
     }
-    out
 }
 
 #[cfg(test)]
@@ -4476,20 +4480,22 @@ impl Shadow {
         let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
         crate::land::spent(crate::land::stat::LOCK, waiting);
         let (from, to) = pieces.iter().fold((usize::MAX, 0), |(a, b), p| (a.min(p.0), b.max(p.1)));
-        let skip: Vec<(usize, usize)> = {
+        let mut skip: Vec<(usize, usize)> = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
             let mut skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < to && b > from).collect();
             sent.near(fetched_after, from, to, &mut skip);
             skip
         };
+        skip.sort_unstable();
+        let mut parts = Vec::new();
         let mut put = 0;
         for &(lo, hi, now) in pieces {
             if lo >= hi || hi > self.len as usize {
                 continue;
             }
-            let near: Vec<(usize, usize)> = skip.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
-            let parts: Vec<(usize, usize)> = outside(lo, hi, near).into_iter().map(|(a, b)| (a - lo, b - lo)).collect();
+            parts.clear();
+            outside_sorted(lo, hi, &skip, |a, b| parts.push((a - lo, b - lo)));
             // SAFETY: inside the mapping (checked above), in a range
             // declared and not done with, which no refresh writes; the
             // title's bytes are kept out by the lock; the caller's.
