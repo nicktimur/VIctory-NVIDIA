@@ -771,9 +771,9 @@ pub(crate) static ALIVE: [std::sync::atomic::AtomicU64; 8] = [const { std::sync:
 /// makes at its start).
 pub(crate) static LISTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
-/// The process's private bytes (diagnostics: around the making of lists).
+/// The process's working set and commit, in bytes.
 #[cfg(feature = "diagnostics")]
-fn private_bytes() -> u64 {
+fn process_memory() -> Option<[u64; 2]> {
     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut c = PROCESS_MEMORY_COUNTERS {
@@ -781,8 +781,14 @@ fn private_bytes() -> u64 {
         ..Default::default()
     };
     // SAFETY: our own process and a sized structure.
-    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
-    c.PagefileUsage as u64
+    let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) } != 0;
+    ok.then_some([c.WorkingSetSize as u64, c.PagefileUsage as u64])
+}
+
+/// The process's private bytes (diagnostics: around the making of lists).
+#[cfg(feature = "diagnostics")]
+fn private_bytes() -> u64 {
+    process_memory().map_or(0, |[_, commit]| commit)
 }
 
 /// What the runtime does when the host GPU fails for good: report it like a
@@ -8948,6 +8954,14 @@ impl Meter {
             self.logged = now;
             if let Some(free) = available_physical_ram() {
                 tracing::info!(available_mib = free >> 20, "system RAM headroom");
+            }
+            #[cfg(feature = "diagnostics")]
+            if let Some([working_set, commit]) = process_memory() {
+                tracing::info!(
+                    working_set_mib = working_set >> 20,
+                    private_commit_mib = commit >> 20,
+                    "process RAM"
+                );
             }
             host.log_video_memory("during gameplay");
             tracing::info!(
