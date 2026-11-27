@@ -113,7 +113,7 @@ static QUEUE: (Mutex<WorkQueue<Arc<Job>>>, Condvar) = (
 /// A submitted copy without a provable completion cannot be retried safely.
 static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Those on their way, by host copy ([`HostTexture::serial`]).
-static ON_THEIR_WAY: Mutex<Vec<(u64, Arc<Job>)>> = Mutex::new(Vec::new());
+static ON_THEIR_WAY: Mutex<BTreeMap<u64, Arc<Job>>> = Mutex::new(BTreeMap::new());
 static LANDED: Condvar = Condvar::new();
 static BYTES: AtomicU64 = AtomicU64::new(0);
 /// Since the start: uploads, bytes, microseconds from the asking until the
@@ -168,7 +168,7 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     let copy = crate::resource::host_copy(resource)?;
     if copy.ahead.load(Relaxed) == PENDING {
         let way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
-        return way.iter().find(|(serial, _)| *serial == copy.serial).map(|(_, job)| Taken::Known(job.clone()));
+        return way.get(&copy.serial).cloned().map(Taken::Known);
     }
     if BYTES.load(Relaxed) >= most()
         || copy.flags() & 0x7 != 0
@@ -224,7 +224,7 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         retries: AtomicU64::new(0),
         then: Mutex::new(Some(Vec::new())),
     });
-    ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner()).push((job.copy.serial, job.clone()));
+    ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner()).insert(job.copy.serial, job.clone());
     Some(Taken::New(job))
 }
 
@@ -243,7 +243,7 @@ pub(crate) fn listed(copy: &HostTexture) {
     STATS[5].fetch_add(1, Relaxed);
     let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
     let started = std::time::Instant::now();
-    while way.iter().any(|(serial, _)| *serial == copy.serial) && started.elapsed().as_millis() < 1000 {
+    while way.contains_key(&copy.serial) && started.elapsed().as_millis() < 1000 {
         way = LANDED.wait_timeout(way, std::time::Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
     }
 }
@@ -475,7 +475,9 @@ fn finish(jobs: Vec<Arc<Job>>) {
     }
     {
         let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
-        way.retain(|(serial, _)| !jobs.iter().any(|job| job.copy.serial == *serial));
+        for job in &jobs {
+            way.remove(&job.copy.serial);
+        }
         LANDED.notify_all();
     }
     for job in &jobs {
