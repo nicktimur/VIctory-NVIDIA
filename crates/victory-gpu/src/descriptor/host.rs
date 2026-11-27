@@ -944,7 +944,7 @@ struct Waiting {
 }
 
 /// Whether due texture slots are served in turns, a slot looked at before
-/// and one never looked at ([`TextureQueue::due`]; on unless
+/// and one never looked at ([`TextureQueue::due_and_census`]; on unless
 /// `VICTORY_FAIR_DUE=0`).
 fn fair_due() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -998,18 +998,30 @@ impl TextureQueue {
     ///   cutscene, which the pass's time then cut, and slots never looked
     ///   at waited 300 to 1,500 frames: faces whose textures are picked by
     ///   index read an empty slot (black) or an older view (red, noise).
-    fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        if max == 0 {
-            return Vec::new();
+    fn due_and_census(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
+        let mut counts = [self.slots.len() as u64, 0, 0, 0, 0];
+        let mut again = Vec::new();
+        let mut fresh = Vec::new();
+        for (&index, w) in &self.slots {
+            if w.mapped > 0 {
+                counts[3] += 1;
+            } else if w.looks > 0 {
+                counts[2] += 1;
+            }
+            if w.due <= frame {
+                counts[1] += 1;
+                counts[4] = counts[4].max(frame.saturating_sub(w.written));
+                if max != 0 {
+                    let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
+                    class.push((index, w.write));
+                }
+            }
         }
-        let mut again: Vec<(u64, u32, u64)> = Vec::new();
-        let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
-        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
-            class.push((w.written, index, w.write));
+        if again.is_empty() && fresh.is_empty() {
+            return (Vec::new(), counts);
         }
         // By the number of the write, counted over the run.
-        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+        let newest_first = |a: &(u32, u64), b: &(u32, u64)| b.1.cmp(&a.1);
         // Only `max` retries can be returned, even when tens of thousands
         // are due. Partition first, then sort the bounded prefix.
         if again.len() > max {
@@ -1042,20 +1054,20 @@ impl TextureQueue {
         let (mut new, mut old_at) = (0, old.len());
         while new < fresh.len() || old_at > 0 {
             if new < fresh.len() {
-                fresh_order.push((fresh[new].1, fresh[new].2));
+                fresh_order.push(fresh[new]);
                 new += 1;
             }
             if old_at > 0 {
                 old_at -= 1;
-                fresh_order.push((old[old_at].1, old[old_at].2));
+                fresh_order.push(old[old_at]);
             }
         }
-        let mut again_order = again.iter().map(|&(_, index, write)| (index, write));
+        let mut again_order = again.iter().copied();
         if !fair_due() {
             let mut order: Vec<(u32, u64)> = again_order.collect();
             order.extend(fresh_order);
             order.truncate(max);
-            return order;
+            return (order, counts);
         }
         let mut fresh_order = fresh_order.into_iter();
         let mut order = Vec::with_capacity(max.min(fresh.len() + again.len()));
@@ -1068,7 +1080,7 @@ impl TextureQueue {
             order.extend(b);
         }
         order.truncate(max);
-        order
+        (order, counts)
     }
 
     /// The entry of `index` if it is still the write the pass was handed.
@@ -1166,23 +1178,14 @@ impl TextureQueue {
         self.slots.get(&index).map_or(0, |w| w.mapped)
     }
 
-    /// For the frame line: slots in the queue; of them due at `frame`;
-    /// waiting for their memory (looked at, never uploaded); uploaded in
-    /// part; and the frames the oldest due one has waited since its write.
+    #[cfg(test)]
+    fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        self.due_and_census(frame, max).0
+    }
+
+    #[cfg(test)]
     fn census(&self, frame: u64) -> [u64; 5] {
-        let mut c = [self.slots.len() as u64, 0, 0, 0, 0];
-        for w in self.slots.values() {
-            if w.mapped > 0 {
-                c[3] += 1;
-            } else if w.looks > 0 {
-                c[2] += 1;
-            }
-            if w.due <= frame {
-                c[1] += 1;
-                c[4] = c[4].max(frame.saturating_sub(w.written));
-            }
-        }
-        c
+        self.due_and_census(frame, 0).1
     }
 }
 
@@ -1848,12 +1851,11 @@ impl HostHeap {
     }
 
     /// Up to `max` title slots whose texture view is due at `frame`, each
-    /// with its write number, in the order to serve them
-    /// ([`TextureQueue::due`]), and the queue's counts
-    /// ([`TextureQueue::census`]).
+    /// with its write number in service order, and the queue counts.
+    /// Counts are total, due, waiting, partially uploaded, and oldest due age.
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+        textures.due_and_census(frame, max)
     }
 
     /// A number that changes when a slot is written or made due anew, and
