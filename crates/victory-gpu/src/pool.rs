@@ -580,7 +580,7 @@ mod tests {
 
     #[test]
     fn pieces_never_overlap_and_rest_before_they_are_used_again() {
-        let mut pool: Pool<u32> = Pool::new(SPARE);
+        let mut pool: Pool<u32> = Pool::new(SPARE, false);
         let made = std::cell::Cell::new(0);
         let make = || {
             made.set(made.get() + 1);
@@ -610,13 +610,13 @@ mod tests {
         assert_eq!(pool.blocks(), blocks.min(SPARE));
         // Too big for a block, and a block that cannot be made.
         assert!(pool.take(BLOCK, 65536, 30, make).is_none());
-        let mut none: Pool<u32> = Pool::new(SPARE);
+        let mut none: Pool<u32> = Pool::new(SPARE, false);
         assert!(none.take(65536, 65536, 0, || None).is_none());
     }
 
     #[test]
     fn pieces_come_from_blocks_older_than_the_lists_that_run() {
-        let mut pool: Pool<u64> = Pool::new(SPARE_KEPT);
+        let mut pool: Pool<u64> = Pool::new(SPARE_KEPT, false);
         let made = std::cell::Cell::new(0);
         let make = || {
             made.set(made.get() + 1);

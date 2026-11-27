@@ -449,21 +449,21 @@ mod tests {
             runs.fetch_add(1, Ordering::Relaxed);
             Ok(shader())
         };
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &build, container, translate), Ok((shader(), false)));
+        assert_eq!(cached(&cache, &build, container, translate), Ok((shader(), true)));
         assert_eq!(runs.load(Ordering::Relaxed), 1, "the second came from disk");
 
         // Another build translates again.
-        assert_eq!(cached(&cache, &[8; 32], container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &[8; 32], container, translate), Ok((shader(), false)));
         assert_eq!(runs.load(Ordering::Relaxed), 2);
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
             std::fs::write(e, b"VSH1 broken").unwrap();
         }
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &build, container, translate), Ok((shader(), false)));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &build, container, translate), Ok((shader(), true)));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
 
         // Failures are not stored.
