@@ -152,9 +152,12 @@ fn child(these: &[usize], mut each: impl FnMut(usize, f64, bool)) -> (usize, Opt
     let hung = AtomicBool::new(false);
     let mut made = 0;
     std::thread::scope(|s| {
-        s.spawn(|| {
-            while !over.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(500));
+        let watchdog = s.spawn(|| {
+            while !over.load(Ordering::Acquire) {
+                std::thread::park_timeout(Duration::from_millis(500));
+                if over.load(Ordering::Acquire) {
+                    break;
+                }
                 if lock(&heard).elapsed() > LONGEST {
                     hung.store(true, Ordering::Relaxed);
                     let _ = lock(&process).kill();
@@ -173,7 +176,8 @@ fn child(these: &[usize], mut each: impl FnMut(usize, f64, bool)) -> (usize, Opt
                 each(n, ms, there == "1");
             }
         }
-        over.store(true, Ordering::Relaxed);
+        over.store(true, Ordering::Release);
+        watchdog.thread().unpark();
     });
     let status = lock(&process).wait();
     let well = status.as_ref().is_ok_and(|s| s.success());
