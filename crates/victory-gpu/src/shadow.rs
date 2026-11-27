@@ -1256,6 +1256,10 @@ mod relay_tests {
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+const SNAPSHOT_SPARE: usize = 512 << 20;
+const SNAPSHOT_HEADROOM: usize = 192 << 20;
+static SNAPSHOT_BUDGET: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(SNAPSHOT_HEADROOM);
 
 /// An empty buffer with room for `n` bytes, from the pool if it has one
 /// of about that size: a small copy's snapshot took the 174 MB buffer kept
@@ -1278,8 +1282,8 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
-/// How many snapshot buffers are kept (`VICTORY_SNAPSHOT_POOL`; `8`: as
-/// before).
+/// How many snapshot buffers are kept (`VICTORY_SNAPSHOT_POOL`; 1024 by
+/// default, subject to the byte budget).
 ///
 /// A frame gives some 330 ranges of copies in the PC's memory to shaders, and
 /// most are of copies of their own; with two or three frames in the air eight
@@ -1292,26 +1296,65 @@ fn snapshots_kept() -> usize {
     *MOST.get_or_init(|| std::env::var("VICTORY_SNAPSHOT_POOL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024))
 }
 
-/// Returns a snapshot buffer to the pool: at most [`snapshots_kept`] kept,
-/// the largest, and of those the largest one and the next ones up to `KEPT`
-/// bytes in all.
+/// Returns a snapshot buffer to the pool, largest capacities first.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    let headroom = crate::host::memory_headroom();
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+    let limit = if headroom { SNAPSHOT_BUDGET.load(Ordering::Relaxed) } else { SNAPSHOT_SPARE };
+    if headroom && v.capacity() > limit {
+        return;
+    }
+    let at = pool.partition_point(|kept| kept.capacity() >= v.capacity());
+    pool.insert(at, v);
+    let gone = trim_snapshots(&mut pool, limit, !headroom);
+    drop(pool);
+    drop(gone);
+}
+
+fn trim_snapshots(pool: &mut Vec<Vec<u8>>, limit: usize, keep_oversized: bool) -> Vec<Vec<u8>> {
+    let oversized = if keep_oversized { 0 } else { pool.partition_point(|v| v.capacity() > limit) };
+    let mut gone: Vec<_> = pool.drain(..oversized).collect();
     let (mut kept, mut total) = (0, 0usize);
     for v in pool.iter().take(snapshots_kept()) {
         total = total.saturating_add(v.capacity());
-        if kept > 0 && total > KEPT {
+        if total > limit && (kept != 0 || !keep_oversized) {
             break;
         }
         kept += 1;
     }
-    // (Given back to the kernel without the lock: milliseconds.)
-    let gone = pool.split_off(kept);
+    gone.extend(pool.drain(kept..));
+    gone
+}
+
+fn snapshot_budget(available: Option<u64>) -> usize {
+    if available.is_some_and(|free| free < 4 << 30) { 64 << 20 } else { SNAPSHOT_HEADROOM }
+}
+
+fn trim_snapshot_pool(available: Option<u64>) {
+    if !crate::host::memory_headroom() {
+        return;
+    }
+    let limit = snapshot_budget(available);
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    SNAPSHOT_BUDGET.store(limit, Ordering::Relaxed);
+    let gone = trim_snapshots(&mut pool, limit, false);
     drop(pool);
     drop(gone);
+}
+
+#[cfg(test)]
+#[test]
+fn snapshot_headroom_never_retains_an_oversized_spare() {
+    let mut pool = vec![Vec::with_capacity(32), Vec::with_capacity(16), Vec::with_capacity(8)];
+    let gone = trim_snapshots(&mut pool, 48, false);
+    assert_eq!(gone.len(), 1);
+    assert_eq!(pool.len(), 2);
+    assert_eq!(trim_snapshots(&mut pool, 31, false).len(), 1);
+    assert_eq!(pool[0].capacity(), 16);
+    assert_eq!(trim_snapshots(&mut pool, 15, false).len(), 1);
+    assert!(pool.is_empty());
+    assert_eq!(snapshot_budget(Some((4 << 30) - 1)), 64 << 20);
+    assert_eq!(snapshot_budget(Some(4 << 30)), SNAPSHOT_HEADROOM);
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -2808,6 +2851,8 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
+    let available = crate::host::available_physical_ram();
+    trim_snapshot_pool(available);
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -2815,7 +2860,7 @@ pub(crate) fn let_go_idle() {
         if map.is_empty() {
             return;
         }
-        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+        let idle_ms = crate::host::ram_idle_ms(available);
         let now = crate::host::moment();
         let idle: Vec<(u64, u64)> = map
             .iter()
