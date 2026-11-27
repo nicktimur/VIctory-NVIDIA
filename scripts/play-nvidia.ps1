@@ -4,10 +4,11 @@
 #                  so a Smooth Motion profile set for that exe in the NVIDIA App applies every time.
 # -SeriesX         the Series X profile instead (slower: about 7 fps at half scale)
 # -Quality         fewer stretched/jumping bodies and less rainbow skin, at about 13 fps instead of about 20
-# -RecordPipelines record used pipelines for an offline warm-up on later launches
-# -WarmUsedPipelines warm recorded pipelines before launch and keep recording this run (same as the default)
-# -SkipShaderPrecompile skip the shader translation cache warm-up before launch
-# -SkipPipelineWarmup skip compiling pipelines recorded by earlier runs
+# -PrecompileShaders scan the game files and populate the shader cache before launch (off by default).
+# -WarmUsedPipelines warm only pipelines drawn with in previous sessions (off by default).
+# -WarmAllPipelines warm every recorded pipeline before launch (can take hours; off by default).
+# -SkipShaderPrecompile and -SkipPipelineWarmup override the respective opt-in modes.
+# -RecordPipelines is accepted for compatibility; the launcher always records pipelines.
 # -RayTracing      keep the title's ray-tracing passes (off by default: see below)
 # -Resolution      the height the game renders at before the title's own upscaler: 2160, 1440, 1080, 720, 540 or 480.
 #                  Series S outputs 1080p (so up to 1080 there), Series X 2160p. Default: half the output (540 on S,
@@ -25,7 +26,9 @@ param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$NoSmoothMotion,
     [switch]$RecordPipelines,
+    [switch]$PrecompileShaders,
     [switch]$WarmUsedPipelines,
+    [switch]$WarmAllPipelines,
     [switch]$SkipShaderPrecompile,
     [switch]$SkipPipelineWarmup,
     [switch]$SeriesX,
@@ -83,11 +86,9 @@ $rtList = Join-Path $PSScriptRoot 'rt_off_hashes.txt'
 if (-not $RayTracing -and (Test-Path $rtList)) {
     $settings.VICTORY_SKIP_PIPELINES = (Get-Content $rtList -Raw).Trim()
 }
-$warmPipelines = (-not $SkipPipelineWarmup) -or $WarmUsedPipelines
-if ($RecordPipelines -or $warmPipelines) {
-    # Record pipelines used in this run so the next launch can compile them first.
-    $settings.VICTORY_PIPELINE_BOOK = '1'
-}
+$settings.VICTORY_PIPELINE_BOOK = '1'
+$prepareShaders = $PrecompileShaders -and -not $SkipShaderPrecompile
+$warmPipelines = ($WarmUsedPipelines -or $WarmAllPipelines) -and -not $SkipPipelineWarmup
 if ($Quality) {
     # Stretched/jumping bodies: relay stage 1 and no card steps (avatarmanz/VIctory-7900XTX issue 13,
     # fxceless/victory-fork issue 89). Rainbow skin: texture refreshes wait for the runtime's remapping.
@@ -174,18 +175,19 @@ try {
         'VICTORY_SUBMIT_FRAMES', 'VICTORY_CARD_BUFFERS_MB', 'VICTORY_PIPELINE_WAIT_MS', 'VICTORY_WINDOWS_BAR_MB') {
         if ($settings.ContainsKey($name)) { $log.WriteLine("$name=$($settings[$name])") }
     }
-    if (-not $SkipShaderPrecompile) {
+    if ($prepareShaders) {
         # The translator cache lives outside the repository. This may take several minutes
         # the first time; later runs reuse cached translations while scanning the same files.
         Write-Host 'Precompiling game shaders into the persistent shader cache before launch...'
         Invoke-VictoryPhase 'Shader precompile' @('shaders')
     }
     if ($warmPipelines) {
-        # Warm every pipeline observed in previous runs. The command resumes from its
-        # persistent done list and isolates slow/crashing driver compiles per process.
-        # This is deliberately a long offline pass: it avoids first-use PSO creation
-        # during gameplay, including pipelines not seen in the most recent session.
-        Invoke-VictoryPhase 'Pipeline warm-up' @('warm')
+        $warmArgs = @('warm')
+        if (-not $WarmAllPipelines) { $warmArgs += '--used' }
+        Invoke-VictoryPhase 'Pipeline warm-up' $warmArgs
+    }
+    if (-not $prepareShaders -and -not $warmPipelines) {
+        $log.WriteLine('Offline warm-up skipped; gameplay uses the persistent caches.')
     }
     Invoke-VictoryPhase 'Gameplay' $runArgs
 } finally {
