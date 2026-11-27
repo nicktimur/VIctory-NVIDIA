@@ -4826,29 +4826,39 @@ impl Host {
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 let _fetching = crate::timeline::span("landing: fetching pieces");
-                if let Some(queue) = &copy_queue {
+                let after = if let Some(queue) = &copy_queue {
                     queue.ExecuteCommandLists(&lists);
                     queue.Signal(&fence, sent)?;
-                    meanwhile();
+                    behind
+                } else {
+                    // Earlier sends are ahead of this fetch, later ones behind it.
+                    let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                    self.queue.ExecuteCommandLists(&lists);
+                    let after = *order;
+                    drop(order);
+                    self.card_sent();
+                    self.queue.Signal(&fence, sent)?;
+                    after
+                };
+                meanwhile();
+                // The copy can finish while the CPU does the overlapping work.
+                // An all-ones fence value means the device was removed.
+                let mut completed = fence.GetCompletedValue();
+                if completed < sent {
                     fence.SetEventOnCompletion(sent, event)?;
                     #[cfg(feature = "diagnostics")]
                     let _card = crate::timeline::card_wait(None);
-                    WaitForSingleObject(event, INFINITE);
-                    return Ok(behind);
+                    if WaitForSingleObject(event, INFINITE) != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                        return Err(windows::core::Error::from_thread());
+                    }
+                    completed = fence.GetCompletedValue();
                 }
-                // In the order of the queue: the sends of title bytes so
-                // far are ahead of this fetch, every later one behind it.
-                let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-                self.queue.ExecuteCommandLists(&lists);
-                let after = *order;
-                drop(order);
-                self.card_sent();
-                self.queue.Signal(&fence, sent)?;
-                meanwhile();
-                fence.SetEventOnCompletion(sent, event)?;
-                #[cfg(feature = "diagnostics")]
-                let _card = crate::timeline::card_wait(None);
-                WaitForSingleObject(event, INFINITE);
+                if completed == u64::MAX {
+                    return Err(windows::core::Error::from_hresult(DXGI_ERROR_DEVICE_REMOVED));
+                }
+                if completed < sent {
+                    return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL));
+                }
                 Ok(after)
             })()
         };
