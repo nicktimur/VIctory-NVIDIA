@@ -91,22 +91,30 @@ static BYTES: AtomicU64 = AtomicU64::new(0);
 /// copy had run, the longest; askings turned down; waits of lists.
 static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
-/// Bound staged copies in flight by the adapter's reported local-memory
-/// budget. A 12 GiB card gets twice the former 96 MiB window; smaller cards
-/// keep the old bound, and larger cards grow conservatively.
+/// Bound upload staging (system RAM) in flight by both host RAM headroom and
+/// the adapter's local-memory budget. Refresh OS queries at most once a
+/// second, rather than once per texture.
 fn most() -> u64 {
-    static MOST: OnceLock<u64> = OnceLock::new();
-    *MOST.get_or_init(|| {
+    const MIB: u64 = 1 << 20;
+    static MOST: AtomicU64 = AtomicU64::new(96 * MIB);
+    static CHECKED: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    if now.saturating_sub(CHECKED.load(Relaxed)) >= 1000 {
         const GIB: u64 = 1 << 30;
-        const MIB: u64 = 1 << 20;
-        match crate::host::host().and_then(|host| host.video_memory()).map(|[budget, ..]| budget) {
+        let video_limit = match crate::host::host().and_then(|host| host.video_memory()).map(|[budget, ..]| budget) {
             Some(budget) if budget <= 6 * GIB => 96 * MIB,
             Some(budget) if budget <= 12 * GIB => 192 * MIB,
             Some(budget) if budget <= 20 * GIB => 256 * MIB,
             Some(_) => 384 * MIB,
             None => 96 * MIB,
-        }
-    })
+        };
+        let ram_limit = crate::host::available_physical_ram()
+            .map(|available| (available / 64).clamp(32 * MIB, 384 * MIB))
+            .unwrap_or(96 * MIB);
+        MOST.store(video_limit.min(ram_limit), Relaxed);
+        CHECKED.store(now, Relaxed);
+    }
+    MOST.load(Relaxed)
 }
 
 /// Reserve capacity before allocating a staging buffer; concurrent draw
@@ -166,7 +174,9 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         copy.ahead.store(LISTED, Relaxed);
         return turned_down();
     };
-    let actual = staging.read as u64;
+    // The placed-footprint buffer includes row padding: charge its actual
+    // system-memory allocation, not only the packed title bytes.
+    let actual = staging.bytes;
     if actual > reserved && !reserve(actual - reserved) {
         BYTES.fetch_sub(reserved, Relaxed);
         copy.ahead.store(LISTED, Relaxed);
@@ -281,7 +291,7 @@ impl Worker {
                 while bytes < BATCH.0 && jobs.len() < BATCH.1
                     && let Some(job) = queue.pop_front()
                 {
-                    bytes += job.staging.read as u64;
+                    bytes += job.staging.bytes;
                     jobs.push(job);
                 }
             }
@@ -376,7 +386,7 @@ fn finish(jobs: Vec<Arc<Job>>) {
         job.staging.dirty.store(false, Relaxed);
         job.staging.note_held();
         job.copy.ahead.store(DONE, Relaxed);
-        BYTES.fetch_sub(job.staging.read as u64, Relaxed);
+        BYTES.fetch_sub(job.staging.bytes, Relaxed);
     }
     {
         let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
