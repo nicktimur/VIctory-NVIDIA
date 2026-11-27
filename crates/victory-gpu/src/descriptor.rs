@@ -369,16 +369,9 @@ pub(crate) fn sync_heaps() {
         let found: Vec<std::sync::Mutex<SyncPart>> = parts.chunks(SYNC_PAGES).map(|_| Default::default()).collect();
         crate::land::each_view(true, found.len(), &|n| {
             let mut out = SyncPart::default();
-            let mut page_bytes: Vec<u8> = Vec::new();
             let mut changed: Vec<u32> = Vec::new();
-            for &(from, to) in parts.chunks(SYNC_PAGES).nth(n).unwrap_or_default() {
-                // The page's records are read through the kernel, into a
-                // copy: a page the title unmaps meanwhile fails the read
-                // where 2,048 reads in place would fault.
-                page_bytes.resize(to - from, 0);
-                if !crate::host::read_into(from as *const u8, &mut page_bytes) {
-                    continue;
-                }
+            let pages = parts.chunks(SYNC_PAGES).nth(n).unwrap_or_default();
+            read_sync_pages(pages, |from, bytes| crate::host::read_into(from as *const u8, bytes), |from, to, page_bytes| {
                 out.pages += 1;
                 out.views += u64::from(crate::watch::guarded(from, to));
                 out.bytes += (to - from) as u64;
@@ -387,7 +380,7 @@ pub(crate) fn sync_heaps() {
                 // to the range that holds its first byte.
                 let first = ((from - start as usize) as u64).div_ceil(step).max(slots.start);
                 let Some(records) = page_bytes.get((start + first * step) as usize - from..) else {
-                    continue;
+                    return;
                 };
                 let count = (records.len() as u64 / step).min(slots.end.saturating_sub(first));
                 out.looked += count;
@@ -439,7 +432,7 @@ pub(crate) fn sync_heaps() {
                         2
                     }] += 1;
                 }
-            }
+            });
             *found[n].lock().unwrap_or_else(|e| e.into_inner()) = out;
         });
         drop(copied);
@@ -503,6 +496,62 @@ struct SyncPart {
     make: Vec<u32>,
     wait: Vec<u32>,
     kinds: [u64; 5],
+}
+
+/// A worker reads touching pages together. If the title unmapped a page
+/// meanwhile, retry separately so readable neighbours are still mirrored.
+#[cfg(windows)]
+fn read_sync_pages(
+    pages: &[(usize, usize)],
+    mut read: impl FnMut(usize, &mut [u8]) -> bool,
+    mut visit: impl FnMut(usize, usize, &[u8]),
+) {
+    let mut bytes = Vec::new();
+    for run in pages.chunk_by(|a, b| a.1 == b.0) {
+        let start = run[0].0;
+        let end = run.last().unwrap().1;
+        bytes.resize(end - start, 0);
+        if read(start, &mut bytes) {
+            for &(from, to) in run {
+                visit(from, to, &bytes[from - start..to - start]);
+            }
+        } else if run.len() > 1 {
+            for &(from, to) in run {
+                bytes.resize(to - from, 0);
+                if read(from, &mut bytes) {
+                    visit(from, to, &bytes);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn descriptor_page_reads_batch_and_recover_readable_neighbours() {
+    let pages = [(0, 4), (4, 8), (8, 12), (16, 20)];
+    let mut calls = Vec::new();
+    let mut seen = Vec::new();
+    read_sync_pages(&pages, |from, bytes| {
+        let to = from + bytes.len();
+        calls.push((from, to));
+        bytes.fill(from as u8);
+        from >= 8 || to <= 4
+    }, |from, to, bytes| {
+        assert_eq!(bytes, &[from as u8; 4]);
+        seen.push((from, to));
+    });
+    assert_eq!(calls, [(0, 12), (0, 4), (4, 8), (8, 12), (16, 20)]);
+    assert_eq!(seen, [(0, 4), (8, 12), (16, 20)]);
+
+    calls.clear();
+    seen.clear();
+    read_sync_pages(&pages, |from, bytes| {
+        calls.push((from, from + bytes.len()));
+        true
+    }, |from, to, _| seen.push((from, to)));
+    assert_eq!(calls, [(0, 12), (16, 20)]);
+    assert_eq!(seen, pages);
 }
 
 /// Pages [`sync_heaps`] gives a thread at a time.
