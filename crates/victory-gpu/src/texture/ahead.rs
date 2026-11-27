@@ -12,9 +12,10 @@
 //! (a copy queue's copies leave it there), from which the card's shaders read
 //! it as any texture.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::Instant;
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
@@ -82,7 +83,33 @@ pub(crate) enum Taken {
     Known(Arc<Job>),
 }
 
-static QUEUE: (Mutex<VecDeque<Arc<Job>>>, Condvar) = (Mutex::new(VecDeque::new()), Condvar::new());
+struct WorkQueue<T> {
+    fresh: VecDeque<T>,
+    retries: BTreeMap<Instant, VecDeque<T>>,
+}
+
+impl<T> WorkQueue<T> {
+    fn defer(&mut self, at: Instant, job: T) {
+        self.retries.entry(at).or_default().push_back(job);
+    }
+
+    fn pop(&mut self, now: Instant) -> Option<T> {
+        if let Some(mut due) = self.retries.first_entry() && *due.key() <= now {
+            let jobs = due.get_mut();
+            let job = jobs.pop_front();
+            if jobs.is_empty() {
+                due.remove();
+            }
+            return job;
+        }
+        self.fresh.pop_front()
+    }
+}
+
+static QUEUE: (Mutex<WorkQueue<Arc<Job>>>, Condvar) = (
+    Mutex::new(WorkQueue { fresh: VecDeque::new(), retries: BTreeMap::new() }),
+    Condvar::new(),
+);
 /// A submitted copy without a provable completion cannot be retried safely.
 static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Those on their way, by host copy ([`HostTexture::serial`]).
@@ -203,7 +230,7 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
 
 /// Sends a job of [`take`] on its way.
 pub(crate) fn send(job: &Arc<Job>) {
-    QUEUE.0.lock().unwrap_or_else(|e| e.into_inner()).push_back(job.clone());
+    QUEUE.0.lock().unwrap_or_else(|e| e.into_inner()).fresh.push_back(job.clone());
     QUEUE.1.notify_one();
 }
 
@@ -292,30 +319,36 @@ impl Worker {
             let mut jobs = Vec::new();
             {
                 let mut queue = QUEUE.0.lock().unwrap_or_else(|e| e.into_inner());
-                while queue.is_empty() && !FAILED.load(Relaxed) {
-                    queue = QUEUE.1.wait(queue).unwrap_or_else(|e| e.into_inner());
-                }
-                if FAILED.load(Relaxed) {
-                    return;
-                }
-                let mut bytes = 0;
-                while bytes < BATCH.0 && jobs.len() < BATCH.1
-                    && let Some(job) = queue.pop_front()
-                {
-                    bytes += job.staging.bytes;
-                    jobs.push(job);
+                loop {
+                    if FAILED.load(Relaxed) {
+                        return;
+                    }
+                    let now = Instant::now();
+                    let mut bytes = 0;
+                    while bytes < BATCH.0 && jobs.len() < BATCH.1
+                        && let Some(job) = queue.pop(now)
+                    {
+                        bytes += job.staging.bytes;
+                        jobs.push(job);
+                    }
+                    if !jobs.is_empty() {
+                        break;
+                    }
+                    queue = if let Some((&at, _)) = queue.retries.first_key_value() {
+                        QUEUE.1.wait_timeout(queue, at.saturating_duration_since(now))
+                            .unwrap_or_else(|e| e.into_inner()).0
+                    } else {
+                        QUEUE.1.wait(queue).unwrap_or_else(|e| e.into_inner())
+                    };
                 }
             }
             let mut ready = Vec::with_capacity(jobs.len());
             let mut pending = Vec::new();
-            let mut retry_after = std::time::Duration::ZERO;
             for job in jobs {
                 job.staging.refresh();
                 if job.staging.ready.load(Relaxed) {
-                    job.retries.store(0, Relaxed);
                     ready.push(job);
                 } else {
-                    retry_after = retry_after.max(job.retry_delay());
                     pending.push(job);
                 }
             }
@@ -323,9 +356,7 @@ impl Worker {
                 // A remap can make a nonblocking snapshot incomplete. Keep
                 // ownership and retry; never publish the pooled buffer's old
                 // bytes as this texture.
-                std::thread::sleep(retry_after);
-                QUEUE.0.lock().unwrap_or_else(|e| e.into_inner()).extend(pending);
-                QUEUE.1.notify_all();
+                defer(pending);
             }
             if ready.is_empty() {
                 continue;
@@ -338,14 +369,16 @@ impl Worker {
                     if FAILED.load(Relaxed) {
                         return;
                     }
-                    let delay = ready.iter().map(|job| job.retry_delay()).max().unwrap_or_default();
-                    std::thread::sleep(delay);
-                    QUEUE.0.lock().unwrap_or_else(|e| e.into_inner()).extend(ready);
-                    QUEUE.1.notify_all();
+                    defer(ready);
                 }
                 Copied::Uncertain(error) => {
                     tracing::error!(%error, "upload completion is uncertain; stopping the copy workers and retaining GPU-visible resources");
-                    FAILED.store(true, Relaxed);
+                    {
+                        // Publish failure under the queue lock so a worker
+                        // cannot miss the wake-up while entering its wait.
+                        let _queue = QUEUE.0.lock().unwrap_or_else(|e| e.into_inner());
+                        FAILED.store(true, Relaxed);
+                    }
                     QUEUE.1.notify_all();
                     // The GPU may still reference this allocator, list and
                     // staging resources. Quarantine them until process exit.
@@ -420,6 +453,17 @@ impl Job {
     }
 }
 
+/// Preserve each job's backoff without holding up ready uploads.
+fn defer(jobs: Vec<Arc<Job>>) {
+    let now = Instant::now();
+    let mut queue = QUEUE.0.lock().unwrap_or_else(|e| e.into_inner());
+    for job in jobs {
+        queue.defer(now + job.retry_delay(), job);
+    }
+    drop(queue);
+    QUEUE.1.notify_all();
+}
+
 /// The jobs' copies have run.
 fn finish(jobs: Vec<Arc<Job>>) {
     for job in &jobs {
@@ -472,6 +516,26 @@ pub(crate) fn fresh() -> AtomicU8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_uploads_run_while_retries_back_off() {
+        use std::time::Duration;
+        let mut queue = WorkQueue { fresh: VecDeque::new(), retries: BTreeMap::new() };
+        let now = Instant::now();
+        let early = now + Duration::from_millis(8);
+        let late = now + Duration::from_millis(128);
+        queue.defer(late, "slow retry");
+        queue.defer(early, "first retry");
+        queue.defer(early, "second retry");
+        queue.fresh.extend(["ready", "later fresh"]);
+        assert_eq!(queue.pop(now), Some("ready"));
+        assert_eq!(queue.pop(early), Some("first retry"));
+        assert_eq!(queue.pop(early), Some("second retry"));
+        assert_eq!(queue.pop(early), Some("later fresh"));
+        assert_eq!(queue.pop(early), None);
+        assert_eq!(queue.pop(late), Some("slow retry"));
+        assert_eq!(queue.pop(late), None);
+    }
 
     /// The texels of a placed texture arrive by the copy queue, all levels of
     /// them, and what waits for them is called then; a second asking finds the
