@@ -4528,15 +4528,21 @@ impl Shadow {
             if lo >= hi || hi > self.len as usize {
                 continue;
             }
-            parts.clear();
-            outside_sorted(lo, hi, &skip, |a, b| parts.push((a - lo, b - lo)));
+            let whole = [(0, hi - lo)];
+            let ranges: &[_] = if skip.is_empty() {
+                &whole
+            } else {
+                parts.clear();
+                outside_sorted(lo, hi, &skip, |a, b| parts.push((a - lo, b - lo)));
+                &parts
+            };
             // SAFETY: inside the mapping (checked above), in a range
             // declared and not done with, which no refresh writes; the
             // title's bytes are kept out by the lock; the caller's.
             // Where title memory is not mapped the CPU's side keeps what
             // the card wrote, as before.
             let merged =
-                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), &parts, true, notes, self) };
+                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), ranges, true, notes, self) };
             self.walls_merged(hi - lo, merged as usize);
             if merged > 0 {
                 self.note_landing(lo, hi);
