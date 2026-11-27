@@ -794,10 +794,8 @@ pub(crate) fn upload_from_copy(
     // pages would turn the zero-filled holes into real texel data; the
     // descriptor queue will retry it after the next mapping notification,
     // while a regular draw asks again when it samples the resource.
-    if crate::resource::title_placed(resource)
-        && !staging.on_demand
-        && mapped_bytes(staging.memory, staging.read) < staging.read as u64
-    {
+    let needs_full_mapping = crate::resource::title_placed(resource) && !staging.on_demand;
+    if needs_full_mapping && mapped_bytes(staging.memory, staging.read) < staging.read as u64 {
         crate::descriptor::host::read_short(staging.memory as u64);
         return;
     }
@@ -807,6 +805,9 @@ pub(crate) fn upload_from_copy(
     }
     if no_wait() && fill_unlocked() {
         let there = match picking {
+            // Keep the full snapshot requirement even if the title remaps
+            // pages between the check above and the actual staging read.
+            _ if needs_full_mapping => staging.read as u64,
             Some(there) if there != u64::MAX => there,
             _ => mapped_bytes(staging.memory, staging.read),
         };
