@@ -450,6 +450,11 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    if scratch_pool() {
+        let limit = scratch_spare_limit();
+        let freed = trim_scratch(&mut SPARE.lock().unwrap_or_else(|e| e.into_inner()), limit);
+        drop(freed);
+    }
 }
 
 /// The number of the newest submission begun, and of the newest of which all
@@ -1956,7 +1961,7 @@ impl<T> Spare<T> {
         None
     }
 
-    /// Drops the oldest idle chunks when the system-RAM allowance falls.
+    /// Drops idle chunks when the system-RAM allowance falls.
     fn trim(&mut self, most: u64) -> Vec<T> {
         let mut dropped = Vec::new();
         while self.bytes > most {
@@ -2006,6 +2011,21 @@ fn scratch_spare_limit() -> u64 {
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
+/// Account for trimmed chunks while still holding the pool lock.
+fn trim_scratch(spare: &mut Spare<Chunk>, limit: u64) -> Vec<Chunk> {
+    let before = spare.bytes;
+    let freed = spare.trim(limit);
+    if !freed.is_empty() {
+        let count = freed.len() as u64;
+        let bytes = before - spare.bytes;
+        ALIVE[1].fetch_sub(count, Ordering::Relaxed);
+        ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
+        ALIVE[3].fetch_sub(count, Ordering::Relaxed);
+        ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
+    }
+    freed
+}
+
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     if scratch_pool()
@@ -2033,11 +2053,10 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     if chunks.is_empty() {
         return;
     }
-    let mut freed = Vec::new();
-    {
+    let freed = {
         let spare_limit = scratch_spare_limit();
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        freed.extend(spare.trim(spare_limit));
+        let mut freed = trim_scratch(&mut spare, spare_limit);
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
                 spare.give(chunk, size, spare_limit)
@@ -2056,7 +2075,8 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
                 }
             }
         }
-    }
+        freed
+    };
     // Freed outside the lock.
     drop(freed);
 }
@@ -9857,6 +9877,11 @@ mod spare {
         assert_eq!(spare.take(1), Some(2));
         assert_eq!(spare.bytes, 0);
         assert!(spare.kept.is_empty());
+        assert_eq!(spare.give(5, 6, 12), None);
+        assert_eq!(spare.give(6, 4, 12), None);
+        assert_eq!(spare.trim(6), [6]);
+        assert_eq!(spare.bytes, 6);
+        assert_eq!(spare.take(6), Some(5));
     }
 }
 
