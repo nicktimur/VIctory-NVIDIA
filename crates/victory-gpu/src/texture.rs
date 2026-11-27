@@ -1385,8 +1385,16 @@ impl Staging {
     /// pages that are there ([`Staging::fill`]). Returns the bytes read.
     fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
+        // A full-length kernel read can still span two title-memory mappings.
+        // Reject it if the mapping epoch changed; the next refresh retries
+        // without blocking the render path.
+        let before = crate::watch::changes();
         let read = with_read(size, |read| {
             if !crate::host::read_into(self.memory, read) {
+                return false;
+            }
+            let after = crate::watch::changes();
+            if before != after || after & 1 != 0 {
                 return false;
             }
             let hash = digest(read);
@@ -1410,39 +1418,45 @@ impl Staging {
 
     /// The first filling of the staging buffer while the runtime is
     /// remapping title memory, of a texture not all of which can be read.
-    /// A short read is not published: the existing staging contents stay
-    /// intact until a later read has all pages that were mapped when the
-    /// upload was recorded, or are mapped now. This avoids uploading a mix
-    /// of new data and zero-filled holes while the runtime temporarily
-    /// unmaps a view to replace one of its pages.
+    /// A short or torn read is not published: the existing staging contents
+    /// stay intact until one snapshot is stable and includes all pages that
+    /// were mapped when the upload was recorded, or are mapped now.
     fn fill(&self, last: &mut Last, size: usize) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let start = self.memory as u64;
         let mut there = 0;
-        let got = with_read(size, |read| {
-            let mut got = 0;
+        let complete = with_read(size, |read| {
+            let mut complete = false;
             for _ in 0..4 {
-                got = crate::host::read_there(self.memory, read) as u64;
+                let before = crate::watch::changes();
+                if before & 1 != 0 {
+                    crate::watch::change_over();
+                    continue;
+                }
+                let got = crate::host::read_there(self.memory, read) as u64;
                 there = mapped_bytes(self.memory, size);
+                let after = crate::watch::changes();
+                if before != after || after & 1 != 0 {
+                    crate::watch::change_over();
+                    continue;
+                }
                 if got >= there.max(self.expected.load(Relaxed)) {
+                    complete = true;
                     break;
                 }
                 crate::watch::change_over();
             }
-            // `read_there` zero-fills pages that could not be read. Never
-            // detile that partial snapshot: it can contain unrelated zero
-            // mip levels and produce visibly corrupt textures. Keep the
-            // last complete staging image, or its initial placeholder, and
-            // let the short-read path below schedule another look.
-            if got >= there.max(self.expected.load(Relaxed)) {
+            // read_there zero-fills absent pages. Do not detile a partial or
+            // mixed-epoch snapshot: it would publish holes over valid texels.
+            if complete {
                 last.hash = Some(digest(read));
                 self.detile(read);
             }
-            got
+            complete
         });
         last.partial = Some(crate::frame::current());
         UNLOCKED[2].fetch_add(1, Relaxed);
-        if got < there.max(self.expected.load(Relaxed)) {
+        if !complete {
             UNLOCKED[3].fetch_add(1, Relaxed);
             last.asked = 0;
             crate::descriptor::host::read_short(start);
