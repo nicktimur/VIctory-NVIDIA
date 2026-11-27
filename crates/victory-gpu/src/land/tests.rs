@@ -119,7 +119,7 @@ fn ordered_pieces_hold_the_same_bytes() {
             }
         }
         let cut: Vec<(usize, usize)> = out.iter().map(|&(_, at, len)| (at, len)).collect();
-        let jobs = jobs(&cut);
+        let jobs = jobs(cut.iter().copied());
         assert_eq!(jobs.iter().cloned().flatten().collect::<Vec<_>>(), (0..cut.len()).collect::<Vec<_>>());
         for w in jobs.windows(2) {
             assert_ne!(cut[w[0].end - 1].0 / BLOCK, cut[w[1].start].0 / BLOCK);
@@ -321,7 +321,7 @@ fn landings_beside_the_title_and_its_refreshes_lose_nothing() {
             let pieces: Vec<Piece> = (0..BLOCKS).map(|b| (1, at + b * BLOCK, BLOCK)).collect();
             let order = ordered(&pieces);
             let cut: Vec<(usize, usize)> = order.iter().map(|&(_, at, len)| (at, len)).collect();
-            let jobs = jobs(&cut);
+            let jobs = jobs(cut.iter().copied());
             let into = held.as_mut_ptr() as usize;
             each(jobs.len(), &|j| {
                 let mut notes = Notes::default();
@@ -452,7 +452,7 @@ fn what_landing_costs() {
                 for beside in [false, true] {
                     frame(&format!("{threads} threads, beside {beside}"), dense, 2, &|landing| {
                         let cut: Vec<(usize, usize)> = landing.iter().map(|p| (p.0, BLOCK)).collect();
-                        let jobs = jobs(&cut);
+                        let jobs = jobs(cut.iter().copied());
                         pool.each(jobs.len(), &|j| {
                             let mut notes = Notes::default();
                             for &(at, now, held) in &landing[jobs[j].clone()] {

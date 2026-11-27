@@ -440,19 +440,22 @@ pub(crate) fn ordered(pieces: &[Piece]) -> Vec<(usize, usize, usize)> {
 
 /// Pieces (title address, bytes; in [`ordered`]'s order) as jobs: runs of
 /// about [`JOB`] bytes that end where a block ends.
-pub(crate) fn jobs(pieces: &[(usize, usize)]) -> Vec<std::ops::Range<usize>> {
+pub(crate) fn jobs(pieces: impl ExactSizeIterator<Item = (usize, usize)>) -> Vec<std::ops::Range<usize>> {
+    let count = pieces.len();
     let mut out: Vec<std::ops::Range<usize>> = Vec::new();
     let (mut from, mut bytes) = (0, 0);
-    for (i, &(at, len)) in pieces.iter().enumerate() {
-        let new_block = i == 0 || pieces[i - 1].0 / BLOCK != at / BLOCK;
-        if bytes >= JOB && new_block {
+    let mut previous_block = usize::MAX;
+    for (i, (at, len)) in pieces.enumerate() {
+        let block = at / BLOCK;
+        if bytes >= JOB && previous_block != block {
             out.push(from..i);
             (from, bytes) = (i, 0);
         }
+        previous_block = block;
         bytes += len;
     }
-    if from < pieces.len() {
-        out.push(from..pieces.len());
+    if from < count {
+        out.push(from..count);
     }
     out
 }

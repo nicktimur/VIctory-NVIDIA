@@ -3629,8 +3629,10 @@ impl RelayBack {
             let start = |i: usize| self.work[i].0.span().0 as usize;
             let mut order: Vec<usize> = (0..pieces.len()).collect();
             order.sort_by_key(|&p| (start(pieces[p].0) + pieces[p].1) / crate::land::BLOCK);
-            let cut: Vec<(usize, usize)> = order.iter().map(|&p| (start(pieces[p].0) + pieces[p].1, pieces[p].2)).collect();
-            let jobs = land::jobs(&cut);
+            let jobs = land::jobs(order.iter().map(|&p| {
+                let (i, at, len) = pieces[p];
+                (start(i) + at, len)
+            }));
             let put: Vec<std::sync::atomic::AtomicU64> = self.work.iter().map(|_| Default::default()).collect();
             land::each(jobs.len(), &|j| {
                 let working = std::time::Instant::now();
@@ -3652,11 +3654,10 @@ impl RelayBack {
             }
         }
         land::spent(land::stat::BACK, merging);
+        COPY_BACK[1].fetch_add(written.iter().sum(), Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
         for ((_, from, to), written) in self.work.iter().zip(written) {
-            COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             crate::copystat::compared(*from, to - from, written as usize);
-            let _ = (from, to);
         }
     }
 }
@@ -4927,9 +4928,9 @@ impl Host {
         let _merging = crate::timeline::span("landing: merging fetched pieces");
         let mut written = 0;
         if land::on() {
-            let titles: Vec<(usize, usize)> =
-                pieces.iter().map(|(shadow, lo, hi, _)| (shadow.span().0 as usize + lo, hi - lo)).collect();
-            let jobs = land::jobs(&titles);
+            let jobs = land::jobs(pieces.iter().map(|(shadow, lo, hi, _)| {
+                (shadow.span().0 as usize + lo, hi - lo)
+            }));
             let put = std::sync::atomic::AtomicU64::new(0);
             land::each(jobs.len(), &|j| {
                 let working = std::time::Instant::now();
