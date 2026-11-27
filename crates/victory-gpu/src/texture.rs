@@ -441,11 +441,28 @@ fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
     out
 }
 
+const READ_SPARE: usize = 16 << 20;
+
+struct ReadScratch {
+    bytes: Vec<u8>,
+    last_large: u64,
+}
+
+impl ReadScratch {
+    fn trim(&mut self, size: usize, now: u64) {
+        if size > READ_SPARE {
+            self.last_large = now;
+        } else if now.saturating_sub(self.last_large) >= 5_000 {
+            self.bytes = Vec::new();
+        }
+    }
+}
+
 thread_local! {
-    /// Room to read a texture's memory into: one buffer per submitting
-    /// thread. Each texture kept its own, a second copy in memory of every
-    /// write-watched or partly mapped texture ever sampled, for the run.
-    static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Scratch memory shared by all texture reads on this thread.
+    static READ: std::cell::RefCell<ReadScratch> = const {
+        std::cell::RefCell::new(ReadScratch { bytes: Vec::new(), last_large: 0 })
+    };
 }
 
 /// Calls `f` with `size` bytes of this thread's read buffer (their
@@ -453,11 +470,25 @@ thread_local! {
 fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
     READ.with(|read| {
         let mut read = read.borrow_mut();
-        if read.len() < size {
-            read.resize(size, 0);
+        if (size > READ_SPARE || read.bytes.capacity() > READ_SPARE) && crate::host::memory_headroom() {
+            read.trim(size, crate::host::coarse_ms());
         }
-        f(&mut read[..size])
+        if read.bytes.len() < size {
+            read.bytes.resize(size, 0);
+        }
+        f(&mut read.bytes[..size])
     })
+}
+
+#[cfg(test)]
+#[test]
+fn oversized_texture_scratch_is_released_after_smaller_reads() {
+    let mut scratch = ReadScratch { bytes: Vec::with_capacity(READ_SPARE + 1), last_large: 0 };
+    scratch.trim(READ_SPARE + 1, 200);
+    scratch.trim(128, 5199);
+    assert!(scratch.bytes.capacity() > READ_SPARE);
+    scratch.trim(128, 5200);
+    assert_eq!(scratch.bytes.capacity(), 0);
 }
 
 /// Whether a texture all of whose memory is mapped is read through the
