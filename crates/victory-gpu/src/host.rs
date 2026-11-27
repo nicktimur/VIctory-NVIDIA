@@ -8680,6 +8680,12 @@ struct Meter {
     copy_stats_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
+    // Host present cadence, accumulated across all frames between log lines.
+    last_present: Option<std::time::Instant>,
+    present_intervals: u64,
+    over_30_fps_budget: u64,
+    over_50_ms: u64,
+    longest_interval: std::time::Duration,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
 }
@@ -8694,6 +8700,11 @@ impl Meter {
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
+            last_present: None,
+            present_intervals: 0,
+            over_30_fps_budget: 0,
+            over_50_ms: 0,
+            longest_interval: std::time::Duration::ZERO,
             caption: None,
         }
     }
@@ -8715,7 +8726,16 @@ impl Meter {
         {
             self.copy_stats_frames += 1;
         }
-        let elapsed = self.since.elapsed();
+        let now = std::time::Instant::now();
+        if let Some(previous) = self.last_present.replace(now) {
+            let interval = now - previous;
+            self.present_intervals += 1;
+            self.over_30_fps_budget +=
+                u64::from(interval > std::time::Duration::from_nanos(33_333_333));
+            self.over_50_ms += u64::from(interval > std::time::Duration::from_millis(50));
+            self.longest_interval = self.longest_interval.max(interval);
+        }
+        let elapsed = now - self.since;
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
@@ -8724,7 +8744,7 @@ impl Meter {
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
-        (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+        (self.since, self.frames, self.drawn) = (now, 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
@@ -8812,8 +8832,16 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
-        if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
-            self.logged = std::time::Instant::now();
+        if now - self.logged >= std::time::Duration::from_secs(5) {
+            tracing::info!(
+                window_s = (now - self.logged).as_secs_f64(),
+                intervals = std::mem::take(&mut self.present_intervals),
+                over_30_fps_budget = std::mem::take(&mut self.over_30_fps_budget),
+                over_50_ms = std::mem::take(&mut self.over_50_ms),
+                max_ms = std::mem::take(&mut self.longest_interval).as_secs_f64() * 1000.0,
+                "host present cadence"
+            );
+            self.logged = now;
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
