@@ -55,6 +55,7 @@ pub(crate) struct Job {
     promoted: std::sync::atomic::AtomicBool,
     /// What to do when it has run; `None`: it has.
     then: Mutex<Option<Vec<Box<dyn FnOnce() + Send>>>>,
+    landed: (Mutex<bool>, Condvar),
 }
 
 impl Job {
@@ -136,7 +137,6 @@ static QUEUE: (Mutex<WorkQueue<Arc<Job>>>, Condvar) = (
 static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Those on their way, by host copy ([`HostTexture::serial`]).
 static ON_THEIR_WAY: Mutex<BTreeMap<u64, Arc<Job>>> = Mutex::new(BTreeMap::new());
-static LANDED: Condvar = Condvar::new();
 static BYTES: AtomicU64 = AtomicU64::new(0);
 /// Since the start: uploads, bytes, microseconds from the asking until the
 /// copy had run, the longest; askings turned down; waits of lists.
@@ -246,6 +246,7 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         retries: AtomicU64::new(0),
         promoted: std::sync::atomic::AtomicBool::new(false),
         then: Mutex::new(Some(Vec::new())),
+        landed: (Mutex::new(false), Condvar::new()),
     });
     ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner()).insert(job.copy.serial, job.clone());
     Some(Taken::New(job))
@@ -260,9 +261,11 @@ pub(crate) fn send(job: &Arc<Job>) {
 /// A list is about to record an upload into `copy`: one on its way here runs
 /// first, and no other is taken after it.
 pub(crate) fn listed(copy: &HostTexture) {
-    if copy.ahead.compare_exchange(NONE, LISTED, Relaxed, Relaxed) != Err(PENDING) {
+    if copy.ahead.compare_exchange(NONE, LISTED, Relaxed, std::sync::atomic::Ordering::Acquire) != Err(PENDING) {
         return;
     }
+    let job = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner()).get(&copy.serial).cloned();
+    let Some(job) = job else { return };
     STATS[5].fetch_add(1, Relaxed);
     // A draw needs this texture now. Give a queued job one early attempt;
     // the worker still validates the snapshot and owns the GPU copy.
@@ -271,10 +274,10 @@ pub(crate) fn listed(copy: &HostTexture) {
     if promoted {
         QUEUE.1.notify_one();
     }
-    let way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
-    drop(LANDED.wait_timeout_while(way, std::time::Duration::from_secs(1), |way| {
-        way.contains_key(&copy.serial)
-    }).unwrap_or_else(|e| e.into_inner()));
+    let (landed, wake) = &job.landed;
+    let landed = landed.lock().unwrap_or_else(|e| e.into_inner());
+    drop(wake.wait_timeout_while(landed, std::time::Duration::from_secs(1), |landed| !*landed)
+        .unwrap_or_else(|e| e.into_inner()));
 }
 
 /// The copy queue and its threads, made on first use.
@@ -499,15 +502,16 @@ fn finish(jobs: Vec<Arc<Job>>) {
         job.staging.uploaded.store(true, Relaxed);
         job.staging.dirty.store(false, Relaxed);
         job.staging.note_held();
-        job.copy.ahead.store(DONE, Relaxed);
+        job.copy.ahead.store(DONE, std::sync::atomic::Ordering::Release);
         BYTES.fetch_sub(job.staging.bytes, Relaxed);
+        *job.landed.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        job.landed.1.notify_all();
     }
     {
         let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
         for job in &jobs {
             way.remove(&job.copy.serial);
         }
-        LANDED.notify_all();
     }
     for job in &jobs {
         let us = job.asked.elapsed().as_micros() as u64;
