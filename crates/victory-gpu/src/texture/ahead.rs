@@ -149,8 +149,13 @@ fn most() -> u64 {
     const MIB: u64 = 1 << 20;
     static MOST: AtomicU64 = AtomicU64::new(96 * MIB);
     static CHECKED: AtomicU64 = AtomicU64::new(0);
-    let now = crate::host::now_ms();
-    if now.saturating_sub(CHECKED.load(Relaxed)) >= 1000 {
+    let now = crate::host::coarse_ms();
+    let checked = CHECKED.load(Relaxed);
+    // Claim the sample before entering DXGI. Other callers can keep using
+    // the last completed budget while this one queries the system.
+    if now.saturating_sub(checked) >= 1000
+        && CHECKED.compare_exchange(checked, now, Relaxed, Relaxed).is_ok()
+    {
         const GIB: u64 = 1 << 30;
         let video_limit = match crate::host::host().and_then(|host| host.video_memory()).map(|[budget, ..]| budget) {
             Some(budget) if budget <= 6 * GIB => 96 * MIB,
@@ -163,7 +168,6 @@ fn most() -> u64 {
             .map(|available| (available / 64).clamp(32 * MIB, 384 * MIB))
             .unwrap_or(96 * MIB);
         MOST.store(video_limit.min(ram_limit), Relaxed);
-        CHECKED.store(now, Relaxed);
     }
     MOST.load(Relaxed)
 }
