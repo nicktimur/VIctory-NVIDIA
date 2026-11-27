@@ -342,13 +342,23 @@ pub(crate) fn sync_heaps() {
         let began = std::time::Instant::now();
         let taken = written.take(start as usize, end as usize);
         spent[0] += since(began);
+        let mirror_end = (start + u64::from(mirrored_count) * step) as usize;
         let mut parts: Vec<(usize, usize)> = Vec::new();
         for (range_from, range_end) in taken {
+            // Consume the write-watch range, but never read bytes of slots
+            // this adapter cannot mirror.
+            let range_end = range_end.min(mirror_end);
+            if range_from >= range_end {
+                continue;
+            }
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
                 parts.push((page.max(range_from), (page + crate::watch::PAGE).min(range_end)));
                 page += crate::watch::PAGE;
             }
+        }
+        if parts.is_empty() {
+            continue;
         }
         // A few pages a thread at a time: read, compared with what was last
         // seen there and sorted out, beside one another (14 ms a frame of one

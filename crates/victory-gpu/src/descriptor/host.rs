@@ -4554,6 +4554,11 @@ impl Copied<'_> {
 /// Most of a changed page is as it was: it is looked at sixteen records at a
 /// time.
 fn changed_records(last: &mut [u8], records: &[u8], step: usize, first: u32, out: &mut Vec<u32>) {
+    match step {
+        16 => return changed_records_fixed::<16>(last, records, first, out),
+        32 => return changed_records_fixed::<32>(last, records, first, out),
+        _ => {}
+    }
     const AT_A_TIME: usize = 16;
     let block = AT_A_TIME * step;
     for (b, (old, new)) in last.chunks_mut(block).zip(records.chunks(block)).enumerate() {
@@ -4563,6 +4568,25 @@ fn changed_records(last: &mut [u8], records: &[u8], step: usize, first: u32, out
         for (n, (old, new)) in old.chunks_exact_mut(step).zip(new.chunks_exact(step)).enumerate() {
             if old != new {
                 old.copy_from_slice(new);
+                out.push(first + (b * AT_A_TIME + n) as u32);
+            }
+        }
+    }
+}
+
+fn changed_records_fixed<const STEP: usize>(
+    last: &mut [u8], records: &[u8], first: u32, out: &mut Vec<u32>,
+) {
+    const AT_A_TIME: usize = 16;
+    let (last, _) = last.as_chunks_mut::<STEP>();
+    let (records, _) = records.as_chunks::<STEP>();
+    for (b, (old, new)) in last.chunks_mut(AT_A_TIME).zip(records.chunks(AT_A_TIME)).enumerate() {
+        if old == new {
+            continue;
+        }
+        for (n, (old, new)) in old.iter_mut().zip(new).enumerate() {
+            if old != new {
+                *old = *new;
                 out.push(first + (b * AT_A_TIME + n) as u32);
             }
         }
