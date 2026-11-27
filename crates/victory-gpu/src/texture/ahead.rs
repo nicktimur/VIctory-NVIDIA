@@ -83,6 +83,8 @@ pub(crate) enum Taken {
 }
 
 static QUEUE: (Mutex<VecDeque<Arc<Job>>>, Condvar) = (Mutex::new(VecDeque::new()), Condvar::new());
+/// A submitted copy without a provable completion cannot be retried safely.
+static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Those on their way, by host copy ([`HostTexture::serial`]).
 static ON_THEIR_WAY: Mutex<Vec<(u64, Arc<Job>)>> = Mutex::new(Vec::new());
 static LANDED: Condvar = Condvar::new();
@@ -127,7 +129,7 @@ fn reserve(bytes: u64) -> bool {
 /// Takes the first upload of `resource`'s levels from `first` on, `there` of
 /// whose bytes are mapped (`u64::MAX`: not known). `None`: the list's.
 pub(crate) fn take(resource: This, first: u32, there: u64) -> Option<Taken> {
-    if on() { claim(resource, first, there) } else { None }
+    if on() && !FAILED.load(Relaxed) { claim(resource, first, there) } else { None }
 }
 
 fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
@@ -264,6 +266,12 @@ struct Worker {
 // SAFETY: a worker's objects are its thread's own; the queue is free-threaded.
 unsafe impl Send for Worker {}
 
+enum Copied {
+    Complete,
+    Rejected(windows::core::Error),
+    Uncertain(windows::core::Error),
+}
+
 impl Worker {
     fn new(device: &ID3D12Device, queue: ID3D12CommandQueue) -> windows::core::Result<Worker> {
         // SAFETY: plain object creation.
@@ -284,8 +292,11 @@ impl Worker {
             let mut jobs = Vec::new();
             {
                 let mut queue = QUEUE.0.lock().unwrap_or_else(|e| e.into_inner());
-                while queue.is_empty() {
+                while queue.is_empty() && !FAILED.load(Relaxed) {
                     queue = QUEUE.1.wait(queue).unwrap_or_else(|e| e.into_inner());
+                }
+                if FAILED.load(Relaxed) {
+                    return;
                 }
                 let mut bytes = 0;
                 while bytes < BATCH.0 && jobs.len() < BATCH.1
@@ -320,36 +331,66 @@ impl Worker {
                 continue;
             }
             value += 1;
-            if let Err(e) = self.copy(&ready, value) {
-                tracing::warn!(error = %e, "uploads ahead did not run");
-                let delay = ready.iter().map(|job| job.retry_delay()).max().unwrap_or_default();
-                std::thread::sleep(delay);
-                QUEUE.0.lock().unwrap_or_else(|e| e.into_inner()).extend(ready);
-                QUEUE.1.notify_all();
-                continue;
+            match self.copy(&ready, value) {
+                Copied::Complete => finish(ready),
+                Copied::Rejected(error) => {
+                    tracing::warn!(%error, "uploads ahead were rejected before submission");
+                    if FAILED.load(Relaxed) {
+                        return;
+                    }
+                    let delay = ready.iter().map(|job| job.retry_delay()).max().unwrap_or_default();
+                    std::thread::sleep(delay);
+                    QUEUE.0.lock().unwrap_or_else(|e| e.into_inner()).extend(ready);
+                    QUEUE.1.notify_all();
+                }
+                Copied::Uncertain(error) => {
+                    tracing::error!(%error, "upload completion is uncertain; stopping the copy workers and retaining GPU-visible resources");
+                    FAILED.store(true, Relaxed);
+                    QUEUE.1.notify_all();
+                    // The GPU may still reference this allocator, list and
+                    // staging resources. Quarantine them until process exit.
+                    std::mem::forget(self);
+                    return;
+                }
             }
-            finish(ready);
         }
     }
 
-    fn copy(&self, jobs: &[Arc<Job>], value: u64) -> windows::core::Result<()> {
+    fn copy(&self, jobs: &[Arc<Job>], value: u64) -> Copied {
         // SAFETY: this worker's allocator and list, whose last submission has
         // run; the jobs hold what the list names until after the wait.
         unsafe {
-            self.allocator.Reset()?;
-            self.list.Reset(&self.allocator, None)?;
+            if let Err(error) = self.allocator.Reset() {
+                return Copied::Rejected(error);
+            }
+            if let Err(error) = self.list.Reset(&self.allocator, None) {
+                return Copied::Rejected(error);
+            }
             for job in jobs {
                 job.record(&self.list);
             }
-            self.list.Close()?;
-            self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
-            self.queue.Signal(&self.fence, value)?;
-            // Keep the staging buffers alive and this worker's allocator/list
-            // untouched until the copy queue has actually consumed the batch.
-            self.fence.SetEventOnCompletion(value, self.event)?;
-            WaitForSingleObject(self.event, INFINITE);
+            if let Err(error) = self.list.Close() {
+                return Copied::Rejected(error);
+            }
+            let commands = match self.list.cast() {
+                Ok(commands) => commands,
+                Err(error) => return Copied::Rejected(error),
+            };
+            self.queue.ExecuteCommandLists(&[Some(commands)]);
+            if let Err(error) = self.queue.Signal(&self.fence, value) {
+                return Copied::Uncertain(error);
+            }
+            // Keep staging buffers and allocator/list alive through completion.
+            if let Err(error) = self.fence.SetEventOnCompletion(value, self.event) {
+                return Copied::Uncertain(error);
+            }
+            if WaitForSingleObject(self.event, INFINITE).0 != 0 && self.fence.GetCompletedValue() < value {
+                return Copied::Uncertain(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_FAIL,
+                ));
+            }
         }
-        Ok(())
+        Copied::Complete
     }
 }
 
