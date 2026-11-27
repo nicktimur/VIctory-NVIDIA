@@ -1691,7 +1691,8 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
-/// up to [`texture_floor_bytes`] bytes of them, beyond that while the card's
+/// up to [`texture_floor_bytes`] bytes of them while within the reported
+/// budget, beyond that while the card's
 /// memory in use by this process is under nine tenths of the budget the system
 /// gives it ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB`
 /// sets a limit on those copies' bytes instead). Past the budget the system moves the card's memory into the PC's,
@@ -1700,6 +1701,11 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     const WITHOUT_BUDGET: u64 = 4 << 30;
+    // A texture floor or an explicit texture-only limit must not admit new
+    // speculative copies when Windows already reports paging pressure.
+    if memory.is_some_and(|[budget, used, ..]| budget != 0 && used >= budget) {
+        return false;
+    }
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
@@ -4594,6 +4600,14 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn texture_admission_stops_at_the_reported_vram_budget() {
+        const GIB: u64 = 1 << 30;
+        assert!(!room(Some([10 * GIB, 10 * GIB, 0, 0])));
+        assert!(!room(Some([10 * GIB, 12 * GIB, 0, 0])));
     }
 
     #[test]
