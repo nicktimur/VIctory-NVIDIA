@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::core::Interface;
 
 use super::Staging;
@@ -234,6 +235,7 @@ struct Worker {
     allocator: ID3D12CommandAllocator,
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
+    event: windows::Win32::Foundation::HANDLE,
 }
 
 // SAFETY: a worker's objects are its thread's own; the queue is free-threaded.
@@ -247,7 +249,9 @@ impl Worker {
             let list: ID3D12GraphicsCommandList =
                 device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
             list.Close()?;
-            Ok(Worker { queue, allocator, list, fence: device.CreateFence(0, D3D12_FENCE_FLAG_NONE)? })
+            let fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+            let event = CreateEventW(None, false, false, None)?;
+            Ok(Worker { queue, allocator, list, fence, event })
         }
     }
 
@@ -291,8 +295,10 @@ impl Worker {
             self.list.Close()?;
             self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
             self.queue.Signal(&self.fence, value)?;
-            // (Without an event: this waits.)
-            self.fence.SetEventOnCompletion(value, windows::Win32::Foundation::HANDLE::default())?;
+            // Keep the staging buffers alive and this worker's allocator/list
+            // untouched until the copy queue has actually consumed the batch.
+            self.fence.SetEventOnCompletion(value, self.event)?;
+            WaitForSingleObject(self.event, INFINITE);
         }
         Ok(())
     }
