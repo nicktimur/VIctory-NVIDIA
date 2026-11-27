@@ -3484,6 +3484,8 @@ struct RelayFetch {
     sent: u64,
     /// Buffer, mapping, bytes.
     buffer: Option<(ID3D12Resource, usize, u64)>,
+    /// Start and peak demand of the current low-usage interval.
+    underused: Option<(std::time::Instant, u64)>,
     /// Pieces caught while a later flight was writing them.
     suspects: torn::Suspects,
     /// What earlier fetches brought of flights not landed yet.
@@ -4672,6 +4674,7 @@ impl Host {
                 event,
                 sent: 0,
                 buffer: None,
+                underused: None,
                 suspects: torn::Suspects::default(),
                 had: crate::land::Had::default(),
             })
@@ -4794,6 +4797,31 @@ impl Host {
         // The sends these flights ran behind, all a fetch on the copy queue
         // is known to have run behind.
         let behind = plans.iter().map(|p| p.0.sent_as).max().unwrap_or(0);
+        if let Some(fetch) = fetch.as_mut()
+            && memory_headroom()
+        {
+            let capacity = fetch.buffer.as_ref().map_or(0, |b| b.2);
+            if capacity > 0 && total <= capacity / 4 && (total == 0 || capacity > 16 << 20) {
+                let (since, peak) = fetch.underused.get_or_insert_with(|| (std::time::Instant::now(), 0));
+                *peak = (*peak).max(total);
+                if since.elapsed() >= std::time::Duration::from_secs(5) {
+                    // Earlier readbacks have finished and been merged on
+                    // this thread. A failed smaller allocation can keep
+                    // using the existing buffer.
+                    if *peak == 0 {
+                        fetch.buffer = None;
+                    } else {
+                        let size = peak.next_multiple_of(16 << 20);
+                        if let Some((buffer, data)) = self.shared_buffer(size) {
+                            fetch.buffer = Some((buffer, data as usize, size));
+                        }
+                    }
+                    fetch.underused = None;
+                }
+            } else {
+                fetch.underused = None;
+            }
+        }
         if pieces.is_empty() {
             // Nothing to fetch: every send so far is older than the next
             // fetch, if that goes to the queue the sends went to.
