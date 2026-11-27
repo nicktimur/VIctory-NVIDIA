@@ -151,7 +151,11 @@ fn flush() {
 fn walk_shaders(dir: &Path, mut f: impl FnMut(u8, [u8; 32], u64, u32)) -> u64 {
     let Ok(file) = std::fs::File::open(dir.join(SHADERS)) else { return 0 };
     let len = file.metadata().map_or(0, |m| m.len());
-    let mut file = std::io::BufReader::new(file);
+    // Shader records are commonly larger than BufReader's 8 KiB default.
+    // A larger window lets seek_relative skip their payloads in memory
+    // instead of issuing one underlying file seek for every record. This
+    // index is rebuilt by every bounded warm-up child process.
+    let mut file = std::io::BufReader::with_capacity(1 << 20, file);
     let mut at = 0;
     let mut head = [0u8; 37];
     while file.read_exact(&mut head).is_ok() {
