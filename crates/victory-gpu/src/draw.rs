@@ -467,13 +467,13 @@ pub(crate) fn take_frame() -> Vec<String> {
 /// The draws dropped since [`take_dropped`].
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) fn dropped_now() -> u64 {
-    DROPPED.load(Ordering::Relaxed)
+    DROPPED.load(Ordering::Relaxed) + BUILDER_OMITTED.load(Ordering::Relaxed)
 }
 
-/// Draws, mesh dispatches and dispatches recorded but not run on the host
-/// (no host pipeline) since the last call.
-pub(crate) fn take_dropped() -> u64 {
-    DROPPED.swap(0, Ordering::Relaxed)
+/// Dropped draws and dispatches, and calls omitted with the ray-tracing
+/// structure builder off, since the last report.
+pub(crate) fn take_dropped() -> [u64; 2] {
+    [DROPPED.swap(0, Ordering::Relaxed), BUILDER_OMITTED.swap(0, Ordering::Relaxed)]
 }
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
 type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
@@ -676,6 +676,7 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 /// as before, they counted as not there at all).
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+static BUILDER_OMITTED: AtomicU64 = AtomicU64::new(0);
 
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
@@ -2660,7 +2661,7 @@ impl State {
         }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            BUILDER_OMITTED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
@@ -3824,6 +3825,7 @@ impl State {
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            BUILDER_OMITTED.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         const DRAW: u32 = 0;
