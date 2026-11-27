@@ -62,9 +62,7 @@ fn book() -> Option<&'static Mutex<Book>> {
         let mut shaders = HashSet::new();
         let ends = [
             walk_shaders(&dir, |_, hash, _, _| drop(shaders.insert(hash))),
-            walk_pipelines(&dir, |_, bytes| {
-                keys.extend(bytes.first_chunk::<16>().copied());
-            }),
+            walk_pipeline_keys(&dir, |key| keys.extend(key)),
         ];
         for (file, end) in [SHADERS, PIPELINES].iter().zip(ends) {
             let path = dir.join(file);
@@ -171,32 +169,47 @@ fn walk_shaders(dir: &Path, mut f: impl FnMut(u8, [u8; 32], u64, u32)) -> u64 {
     at
 }
 
-/// Calls `f` with each pipeline's number and entry; where the last whole one
-/// ends.
-fn walk_pipelines(dir: &Path, mut f: impl FnMut(usize, &[u8])) -> u64 {
-    let bytes = std::fs::read(dir.join(PIPELINES)).unwrap_or_default();
-    let (mut at, mut n) = (0, 0);
-    while let Some(head) = bytes.get(at..at + 4) {
-        let size = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
-        let Some(entry) = bytes.get(at + 4..at + 4 + size) else { break };
-        f(n, entry);
-        (at, n) = (at + 4 + size, n + 1);
+/// Visits each whole record's key without allocating its graphics state.
+fn walk_pipeline_keys(dir: &Path, mut f: impl FnMut(Option<[u8; 16]>)) -> u64 {
+    let Ok(file) = std::fs::File::open(dir.join(PIPELINES)) else { return 0 };
+    let len = file.metadata().map_or(0, |m| m.len());
+    let mut file = std::io::BufReader::with_capacity(1 << 20, file);
+    let mut at = 0u64;
+    let mut head = [0; 4];
+    while file.read_exact(&mut head).is_ok() {
+        let size = u32::from_le_bytes(head);
+        let Some(end) = at.checked_add(4 + u64::from(size)).filter(|&end| end <= len) else { break };
+        let mut key = [0; 16];
+        let key = if size >= 16 {
+            if file.read_exact(&mut key).is_err() {
+                break;
+            }
+            Some(key)
+        } else {
+            None
+        };
+        let skip = size - if key.is_some() { 16 } else { 0 };
+        if skip != 0 && file.seek_relative(i64::from(skip)).is_err() {
+            break;
+        }
+        f(key);
+        at = end;
     }
-    at as u64
+    at
 }
 
 /// How many pipelines are known in `dir`.
 pub fn count(dir: &Path) -> usize {
     let mut n = 0;
-    walk_pipelines(dir, |_, _| n += 1);
+    walk_pipeline_keys(dir, |_| n += 1);
     n
 }
 
 /// The key of each pipeline known in `dir`, as the early list has it.
 pub fn keys(dir: &Path) -> Vec<String> {
     let mut all = Vec::new();
-    walk_pipelines(dir, |_, e| {
-        all.push(e.get(..16).unwrap_or_default().iter().map(|b| format!("{b:02x}")).collect());
+    walk_pipeline_keys(dir, |key| {
+        all.push(key.map_or_else(String::new, |key| format!("{:032x}", u128::from_be_bytes(key))));
     });
     all
 }
@@ -489,7 +502,7 @@ mod tests {
         std::fs::write(dir.join(PIPELINES), &bytes[..bytes.len() - 5]).unwrap();
         assert_eq!(count(&dir), 2);
         assert_eq!(keys(&dir)[1], "01".repeat(16));
-        assert_eq!(walk_pipelines(&dir, |_, _| ()), 48);
+        assert_eq!(walk_pipeline_keys(&dir, |_| ()), 48);
         let mut shader = vec![5u8];
         shader.extend([9; 32]);
         shader.extend(4u32.to_le_bytes());
