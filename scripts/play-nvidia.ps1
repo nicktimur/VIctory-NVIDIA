@@ -18,6 +18,7 @@
 #                  (the release build ignores the ray-tracing skip list: VICTORY_SKIP_PIPELINES is a diagnostics switch)
 # -WindowsBarMB    maximum MiB of title memory windows in CPU-mapped VRAM (by default 3072 on PCs with under
 #                  24 GB of RAM, else 0; -WindowsBarMB 0 turns it off).
+# -LogDirectory    where session logs are saved (defaults to VIctory-Logs on the desktop).
 # -More            other settings: -More @{VICTORY_PANEL='1'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
@@ -34,7 +35,8 @@ param(
     [string]$Adapter,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{},
-    [uint32]$WindowsBarMB
+    [uint32]$WindowsBarMB,
+    [string]$LogDirectory = (Join-Path ([Environment]::GetFolderPath('DesktopDirectory')) 'VIctory-Logs')
 )
 $settings = @{
     # This fork's play set (scripts\play.ps1, not -Safe): the speed set.
@@ -117,7 +119,8 @@ if ($PSBoundParameters.ContainsKey('WindowsBarMB')) {
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 $scale = [double]::Parse($settings.VICTORY_RENDER_SCALE, [Globalization.CultureInfo]::InvariantCulture)
-Write-Host "Series $console, rendering at $([int]($outHeight * $scale))p (render scale $($settings.VICTORY_RENDER_SCALE))"
+$profile = "Series $console, rendering at $([int]($outHeight * $scale))p (render scale $($settings.VICTORY_RENDER_SCALE))"
+Write-Host $profile
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
 if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; return }
@@ -137,23 +140,56 @@ foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 $Exe = (Resolve-Path $Exe).Path
 $runArgs = @('run', $Exe, '--execute')
 if (-not $SeriesX) { $runArgs += @('--console', 'series-s') }
+$logFolder = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LogDirectory)
+[void][IO.Directory]::CreateDirectory($logFolder)
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
+$logPath = Join-Path $logFolder "Series-$console-$stamp-$([Guid]::NewGuid().ToString('N').Substring(0, 8)).log"
+$log = [IO.StreamWriter]::new($logPath, $false, [Text.UTF8Encoding]::new($false))
+$log.AutoFlush = $true
+Write-Host "Session log: $logPath"
+
+function Invoke-VictoryPhase([string]$Phase, [string[]]$Arguments) {
+    $ErrorActionPreference = 'Continue' # Windows PowerShell wraps native stderr in error records.
+    $PSNativeCommandUseErrorActionPreference = $false
+    $log.WriteLine("[$(Get-Date -Format o)] BEGIN $Phase")
+    & $victory @Arguments 2>&1 | ForEach-Object {
+        $line = $_.ToString() -replace '\x1b\[[0-9;]*m', ''
+        $log.WriteLine($line)
+        Write-Host $line
+    }
+    $exitCode = $LASTEXITCODE
+    $log.WriteLine("[$(Get-Date -Format o)] END $Phase (exit $exitCode)")
+    if ($exitCode -ne 0) { throw "$Phase failed with exit code $exitCode" }
+}
+
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try {
+    $log.WriteLine($profile)
+    $log.WriteLine("Build profile: $Build, Quality: $Quality, Smooth Motion launcher: $(-not $NoSmoothMotion)")
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+        $head = git rev-parse --verify HEAD 2>$null
+        if ($LASTEXITCODE -eq 0) { $log.WriteLine("Checkout: $head") }
+    }
+    foreach ($name in 'VICTORY_TEXTURE_NO_WAIT', 'VICTORY_UPLOAD_AHEAD', 'VICTORY_LEVELS_ON_DEMAND',
+        'VICTORY_SUBMIT_FRAMES', 'VICTORY_CARD_BUFFERS_MB', 'VICTORY_PIPELINE_WAIT_MS', 'VICTORY_WINDOWS_BAR_MB') {
+        if ($settings.ContainsKey($name)) { $log.WriteLine("$name=$($settings[$name])") }
+    }
     if (-not $SkipShaderPrecompile) {
         # The translator cache lives outside the repository. This may take several minutes
         # the first time; later runs reuse cached translations while scanning the same files.
         Write-Host 'Precompiling game shaders into the persistent shader cache before launch...'
-        & $victory shaders
-        if ($LASTEXITCODE -ne 0) { throw "Shader precompile failed with exit code $LASTEXITCODE" }
+        Invoke-VictoryPhase 'Shader precompile' @('shaders')
     }
     if ($warmPipelines) {
         # Warm every pipeline observed in previous runs. The command resumes from its
         # persistent done list and isolates slow/crashing driver compiles per process.
         # This is deliberately a long offline pass: it avoids first-use PSO creation
         # during gameplay, including pipelines not seen in the most recent session.
-        & $victory warm
-        if ($LASTEXITCODE -ne 0) { throw "Pipeline warm-up failed with exit code $LASTEXITCODE" }
+        Invoke-VictoryPhase 'Pipeline warm-up' @('warm')
     }
-    & $victory @runArgs
-} finally { Pop-Location }
+    Invoke-VictoryPhase 'Gameplay' $runArgs
+} finally {
+    Pop-Location
+    $log.Dispose()
+}
 
