@@ -228,11 +228,32 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
     let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else { return };
     let wanted: HashSet<usize> = which.iter().copied().collect();
     let mut entries = HashMap::new();
-    walk_pipelines(dir, |n, bytes| {
-        if wanted.contains(&n) {
-            entries.insert(n, bytes.to_vec());
+    if let Ok(pipelines) = std::fs::File::open(dir.join(PIPELINES)) {
+        let len = pipelines.metadata().map_or(0, |m| m.len());
+        let mut pipelines = std::io::BufReader::with_capacity(1 << 20, pipelines);
+        let (mut at, mut n) = (0u64, 0usize);
+        let mut head = [0; 4];
+        while pipelines.read_exact(&mut head).is_ok() {
+            let size = u32::from_le_bytes(head);
+            let Some(end) = at.checked_add(4).and_then(|at| at.checked_add(u64::from(size))) else {
+                break;
+            };
+            if end > len {
+                break;
+            }
+            if wanted.contains(&n) {
+                let mut entry = vec![0; size as usize];
+                if pipelines.read_exact(&mut entry).is_err() {
+                    break;
+                }
+                entries.insert(n, entry);
+            } else if pipelines.seek_relative(i64::from(size)).is_err() {
+                break;
+            }
+            at = end;
+            n += 1;
         }
-    });
+    }
     let mut read = |hash: &[u8; 32]| {
         let &(_, at, len) = places.get(hash)?;
         let mut bytes = vec![0; len as usize];
