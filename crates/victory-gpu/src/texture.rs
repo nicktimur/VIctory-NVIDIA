@@ -1392,12 +1392,14 @@ impl Staging {
         // Reject it if the mapping epoch changed; the next refresh retries
         // without blocking the render path.
         let before = crate::watch::changes();
+        let mapped_before = crate::inplace::shown_runs(self.memory as usize, size);
         let read = with_read(size, |read| {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
             let after = crate::watch::changes();
-            if before != after || after & 1 != 0 {
+            let mapped_after = crate::inplace::shown_runs(self.memory as usize, size);
+            if before != after || after & 1 != 0 || mapped_before != mapped_after {
                 return false;
             }
             let hash = digest(read);
@@ -1436,14 +1438,16 @@ impl Staging {
                     crate::watch::change_over();
                     continue;
                 }
+                let mapped_before = crate::inplace::shown_runs(start as usize, size);
                 let got = crate::host::read_there(self.memory, read) as u64;
                 there = mapped_bytes(self.memory, size);
                 let after = crate::watch::changes();
-                if before != after || after & 1 != 0 {
+                let mapped_after = crate::inplace::shown_runs(start as usize, size);
+                if before != after || after & 1 != 0 || mapped_before != mapped_after {
                     crate::watch::change_over();
                     continue;
                 }
-                if got >= there.max(self.expected.load(Relaxed)) {
+                if there != 0 && got == there && got >= self.expected.load(Relaxed) {
                     complete = true;
                     break;
                 }
