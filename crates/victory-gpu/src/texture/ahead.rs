@@ -51,6 +51,8 @@ pub(crate) struct Job {
     copy: Arc<HostTexture>,
     asked: std::time::Instant,
     retries: AtomicU64,
+    /// A draw can bypass the backoff once, then normal retries resume.
+    promoted: std::sync::atomic::AtomicBool,
     /// What to do when it has run; `None`: it has.
     then: Mutex<Option<Vec<Box<dyn FnOnce() + Send>>>>,
 }
@@ -91,6 +93,26 @@ struct WorkQueue<T> {
 impl<T> WorkQueue<T> {
     fn defer(&mut self, at: Instant, job: T) {
         self.retries.entry(at).or_default().push_back(job);
+    }
+
+    fn promote(&mut self, mut matches: impl FnMut(&T) -> bool) -> bool {
+        if let Some(index) = self.fresh.iter().position(&mut matches) {
+            if let Some(job) = self.fresh.remove(index) {
+                self.fresh.push_front(job);
+            }
+            return true;
+        }
+        let Some((at, job, empty)) = self.retries.iter_mut().find_map(|(&at, jobs)| {
+            let job = jobs.iter().position(&mut matches).and_then(|index| jobs.remove(index))?;
+            Some((at, job, jobs.is_empty()))
+        }) else {
+            return false;
+        };
+        if empty {
+            self.retries.remove(&at);
+        }
+        self.fresh.push_front(job);
+        true
     }
 
     fn pop(&mut self, now: Instant) -> Option<T> {
@@ -222,6 +244,7 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         copy,
         asked: std::time::Instant::now(),
         retries: AtomicU64::new(0),
+        promoted: std::sync::atomic::AtomicBool::new(false),
         then: Mutex::new(Some(Vec::new())),
     });
     ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner()).insert(job.copy.serial, job.clone());
@@ -241,11 +264,17 @@ pub(crate) fn listed(copy: &HostTexture) {
         return;
     }
     STATS[5].fetch_add(1, Relaxed);
-    let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
-    let started = std::time::Instant::now();
-    while way.contains_key(&copy.serial) && started.elapsed().as_millis() < 1000 {
-        way = LANDED.wait_timeout(way, std::time::Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
+    // A draw needs this texture now. Give a queued job one early attempt;
+    // the worker still validates the snapshot and owns the GPU copy.
+    let promoted = QUEUE.0.lock().unwrap_or_else(|e| e.into_inner())
+        .promote(|job| job.copy.serial == copy.serial && !job.promoted.swap(true, Relaxed));
+    if promoted {
+        QUEUE.1.notify_one();
     }
+    let way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
+    drop(LANDED.wait_timeout_while(way, std::time::Duration::from_secs(1), |way| {
+        way.contains_key(&copy.serial)
+    }).unwrap_or_else(|e| e.into_inner()));
 }
 
 /// The copy queue and its threads, made on first use.
@@ -537,6 +566,16 @@ mod tests {
         assert_eq!(queue.pop(early), None);
         assert_eq!(queue.pop(late), Some("slow retry"));
         assert_eq!(queue.pop(late), None);
+
+        queue.fresh.extend(["normal", "needed"]);
+        queue.defer(late, "needed retry");
+        assert!(queue.promote(|job| *job == "needed"));
+        assert_eq!(queue.pop(now), Some("needed"));
+        assert!(queue.promote(|job| *job == "needed retry"));
+        assert_eq!(queue.pop(now), Some("needed retry"));
+        assert_eq!(queue.pop(now), Some("normal"));
+        assert_eq!(queue.pop(late), None);
+        assert!(!queue.promote(|_| true));
     }
 
     /// The texels of a placed texture arrive by the copy queue, all levels of
