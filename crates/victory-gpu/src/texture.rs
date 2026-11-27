@@ -779,6 +779,11 @@ pub(crate) fn upload_from_copy(
     }
     let texture = &copy.texture;
     ahead::listed(copy);
+    // If the copy-queue job did not land before the timeout, do not record a
+    // second copy of the same texture while it may still be in flight.
+    if copy.ahead.load(std::sync::atomic::Ordering::Relaxed) == ahead::PENDING {
+        return;
+    }
     let Some(staging) = staging(resource, copy, first) else {
         return;
     };
@@ -799,6 +804,24 @@ pub(crate) fn upload_from_copy(
     if picking.is_none() {
         // A draw samples it through a table: kept and checked from here on.
         staging.once.store(false, Relaxed);
+    }
+    if no_wait() && fill_unlocked() {
+        let there = match picking {
+            Some(there) if there != u64::MAX => there,
+            _ => mapped_bytes(staging.memory, staging.read),
+        };
+        staging.expected.store(there, Relaxed);
+    }
+    // A rejected first snapshot must not leave a recorded GPU copy pointing
+    // at an uninitialized or recycled staging allocation. Retry this
+    // nonblocking read on the next use; existing uploaded textures retain
+    // their last complete image meanwhile.
+    if no_wait() && !staging.uploaded.load(Relaxed) && !staging.ready.load(Relaxed) {
+        staging.refresh();
+        if !staging.ready.load(Relaxed) {
+            crate::descriptor::host::read_short(staging.memory as u64);
+            return;
+        }
     }
     staging.used.store(crate::host::moment(), Relaxed);
     // Levels on demand: a view of the texture now starts at another
@@ -847,13 +870,6 @@ pub(crate) fn upload_from_copy(
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
-    if no_wait() && fill_unlocked() {
-        let there = match picking {
-            Some(there) if there != u64::MAX => there,
-            _ => mapped_bytes(staging.memory, staging.read),
-        };
-        staging.expected.store(there, Relaxed);
-    }
     const COPY_DEST: u32 = 0x400;
     // A texture cut from a block may lie where another did: what the card
     // holds of that one is done with before the first upload into this one.

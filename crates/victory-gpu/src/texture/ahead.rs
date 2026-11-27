@@ -27,7 +27,7 @@ use crate::resource::HostTexture;
 /// [`HostTexture::ahead`]: no upload was asked for yet; one is on its way
 /// here; it has run; one was recorded into a list.
 pub(crate) const NONE: u8 = 0;
-const PENDING: u8 = 1;
+pub(super) const PENDING: u8 = 1;
 const DONE: u8 = 2;
 pub(crate) const LISTED: u8 = 3;
 
