@@ -405,11 +405,7 @@ impl Queue {
 
     /// Queues an unrequested pipeline or promotes one queued at creation.
     /// Returns whether it is new to the queue, or `None` if nothing changed.
-    fn push(&mut self, p: &Arc<Pending>, priority: u8) -> Option<bool> {
-        self.push_as(p, priority, slow_limit() != usize::MAX && super::library::slow(&p.key))
-    }
-
-    fn push_as(&mut self, p: &Arc<Pending>, priority: u8, slow: bool) -> Option<bool> {
+    fn push(&mut self, p: &Arc<Pending>, priority: u8, slow: bool) -> Option<bool> {
         let prev = p.queue_state.load(Ordering::Relaxed);
         if prev >= priority {
             return None;
@@ -451,6 +447,7 @@ impl Queue {
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
 static AVAILABLE: Condvar = Condvar::new();
+static SCREEN_AVAILABLE: Condvar = Condvar::new();
 
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
@@ -464,14 +461,18 @@ fn start(p: &Arc<Pending>, priority: u8) {
         }
         return;
     }
+    // The persistent slow list is only useful for speculative work.
+    // Read it before taking the lock that workers need to claim jobs.
+    let slow = priority == EARLY && slow_limit() != usize::MAX && super::library::slow(&p.key);
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(new) = queue.push(p, priority) {
+    if let Some(new) = queue.push(p, priority, slow) {
         if new {
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
-        // (One woken could be a worker that takes passes over the screen
-        // alone: it would leave the pipeline to nobody.)
-        AVAILABLE.notify_all();
+        AVAILABLE.notify_one();
+        if priority == REQUESTED && p.screen && screens_first() {
+            SCREEN_AVAILABLE.notify_one();
+        }
     }
 }
 
@@ -479,12 +480,13 @@ fn start(p: &Arc<Pending>, priority: u8) {
 const SCREEN_WORKERS: usize = 2;
 
 fn next(screens_only: bool) -> Arc<Pending> {
+    let available = if screens_only { &SCREEN_AVAILABLE } else { &AVAILABLE };
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
         if let Some(p) = queue.pop(screens_only, slow_limit()) {
             return p;
         }
-        queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+        queue = available.wait(queue).unwrap_or_else(|e| e.into_inner());
     }
 }
 
@@ -532,7 +534,7 @@ fn workers() -> bool {
                         if p.was_slow.load(Ordering::Relaxed) {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
                             queue.slow_now -= 1;
-                            AVAILABLE.notify_all();
+                            AVAILABLE.notify_one();
                         }
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
@@ -617,15 +619,15 @@ mod tests {
         let requested = Arc::new(Pending::new(Vec::new(), None));
         let mut queue = Queue::new();
 
-        assert_eq!(queue.push(&earlier, EARLY), Some(true));
-        assert_eq!(queue.push(&promoted, EARLY), Some(true));
-        assert_eq!(queue.push(&requested, REQUESTED), Some(true));
-        assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
-        assert_eq!(queue.push(&promoted, REQUESTED), None);
+        assert_eq!(queue.push(&earlier, EARLY, false), Some(true));
+        assert_eq!(queue.push(&promoted, EARLY, false), Some(true));
+        assert_eq!(queue.push(&requested, REQUESTED, false), Some(true));
+        assert_eq!(queue.push(&promoted, REQUESTED, false), Some(false));
+        assert_eq!(queue.push(&promoted, REQUESTED, false), None);
 
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &requested));
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &promoted));
-        assert_eq!(queue.push(&promoted, REQUESTED), None);
+        assert_eq!(queue.push(&promoted, REQUESTED, false), None);
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &earlier));
         assert!(queue.pop(false, 1).is_none());
     }
@@ -636,15 +638,15 @@ mod tests {
         let (long, longer, asked, quick) = (new(), new(), new(), new());
         let mut queue = Queue::new();
         for p in [&long, &longer, &asked] {
-            assert_eq!(queue.push_as(p, EARLY, true), Some(true));
+            assert_eq!(queue.push(p, EARLY, true), Some(true));
         }
-        assert_eq!(queue.push_as(&quick, EARLY, false), Some(true));
+        assert_eq!(queue.push(&quick, EARLY, false), Some(true));
         // The quick one first, then one long one at a time; one a draw asks
         // for waits for nobody.
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &quick));
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &long));
         assert!(queue.pop(false, 1).is_none());
-        assert_eq!(queue.push_as(&asked, REQUESTED, true), Some(false));
+        assert_eq!(queue.push(&asked, REQUESTED, true), Some(false));
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &asked));
         assert!(!asked.was_slow.load(Ordering::Relaxed));
         assert!(queue.pop(false, 1).is_none());
@@ -664,8 +666,8 @@ mod tests {
         };
         let (world, screen) = (of(false), of(true));
         let mut queue = Queue::new();
-        assert_eq!(queue.push(&world, REQUESTED), Some(true));
-        assert_eq!(queue.push(&screen, REQUESTED), Some(true));
+        assert_eq!(queue.push(&world, REQUESTED, false), Some(true));
+        assert_eq!(queue.push(&screen, REQUESTED, false), Some(true));
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
