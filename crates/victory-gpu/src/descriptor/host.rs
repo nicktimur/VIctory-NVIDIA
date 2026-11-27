@@ -2096,9 +2096,10 @@ impl HostHeap {
             if waiting.is_empty() {
                 return 0;
             }
+            let now = crate::host::moment();
             let starts: Vec<u64> = waiting
                 .iter()
-                .filter(|&(_, &since)| crate::host::long_ago(since, 1000, 2))
+                .filter(|&(_, &since)| crate::host::long_ago_at(now, since, 1000, 2))
                 .map(|(&start, _)| start)
                 .take(Self::WAITING_A_PASS)
                 .collect();
