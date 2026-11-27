@@ -30,11 +30,8 @@ const PENDING: u8 = 1;
 const DONE: u8 = 2;
 pub(crate) const LISTED: u8 = 3;
 
-/// Bytes of title memory on their way at most: past it uploads go into the
-/// lists, as before.
-const MOST: u64 = 96 << 20;
-/// Bytes and textures of one submission at most.
-const BATCH: (u64, usize) = (16 << 20, 64);
+/// Bytes and textures of one copy-list submission.
+const BATCH: (u64, usize) = (32 << 20, 128);
 
 /// Whether it is on (`VICTORY_UPLOAD_AHEAD`; off).
 pub(crate) fn on() -> bool {
@@ -86,6 +83,31 @@ static BYTES: AtomicU64 = AtomicU64::new(0);
 /// copy had run, the longest; askings turned down; waits of lists.
 static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
+/// Bound staged copies in flight by the adapter's reported local-memory
+/// budget. A 12 GiB card gets twice the former 96 MiB window; smaller cards
+/// keep the old bound, and larger cards grow conservatively.
+fn most() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        match crate::host::host().and_then(|host| host.video_memory()).map(|[budget, ..]| budget) {
+            Some(budget) if budget <= 6 * GIB => 96 * MIB,
+            Some(budget) if budget <= 12 * GIB => 192 * MIB,
+            Some(budget) if budget <= 20 * GIB => 256 * MIB,
+            Some(_) => 384 * MIB,
+            None => 96 * MIB,
+        }
+    })
+}
+
+/// Reserve capacity before allocating a staging buffer; concurrent draw
+/// threads must not each pass the same free-space check.
+fn reserve(bytes: u64) -> bool {
+    let limit = most();
+    BYTES.fetch_update(Relaxed, Relaxed, |used| used.checked_add(bytes).filter(|next| *next <= limit)).is_ok()
+}
+
 /// Takes the first upload of `resource`'s levels from `first` on, `there` of
 /// whose bytes are mapped (`u64::MAX`: not known). `None`: the list's.
 pub(crate) fn take(resource: This, first: u32, there: u64) -> Option<Taken> {
@@ -103,7 +125,7 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         let way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
         return way.iter().find(|(serial, _)| *serial == copy.serial).map(|(_, job)| Taken::Known(job.clone()));
     }
-    if BYTES.load(Relaxed) >= MOST
+    if BYTES.load(Relaxed) >= most()
         || copy.flags() & 0x7 != 0
         || copy.state.load(Relaxed) != 0
         || copy.grown.load(Relaxed)
@@ -115,7 +137,15 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     {
         return turned_down();
     }
+    let Some((_, estimated)) = super::title_span(resource, first) else {
+        return turned_down();
+    };
+    let reserved = estimated;
+    if !reserve(reserved) {
+        return turned_down();
+    }
     if copy.ahead.compare_exchange(NONE, PENDING, Relaxed, Relaxed).is_err() {
+        BYTES.fetch_sub(reserved, Relaxed);
         return turned_down();
     }
     super::PICKING.set(Some(there));
@@ -124,14 +154,23 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     let Some(staging) = staging.filter(|s| {
         !s.on_demand && s.first == s.level0 && !s.uploaded.load(Relaxed) && s.once.load(Relaxed)
     }) else {
+        BYTES.fetch_sub(reserved, Relaxed);
         copy.ahead.store(LISTED, Relaxed);
         return turned_down();
     };
+    let actual = staging.read as u64;
+    if actual > reserved && !reserve(actual - reserved) {
+        BYTES.fetch_sub(reserved, Relaxed);
+        copy.ahead.store(LISTED, Relaxed);
+        return turned_down();
+    }
+    if reserved > actual {
+        BYTES.fetch_sub(reserved - actual, Relaxed);
+    }
     if super::no_wait() && super::fill_unlocked() {
         staging.expected.store(if there == u64::MAX { super::mapped_bytes(staging.memory, staging.read) } else { there }, Relaxed);
     }
     let job = Arc::new(Job { staging, copy, asked: std::time::Instant::now(), then: Mutex::new(Some(Vec::new())) });
-    BYTES.fetch_add(job.staging.read as u64, Relaxed);
     ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner()).push((job.copy.serial, job.clone()));
     Some(Taken::New(job))
 }
@@ -177,7 +216,10 @@ fn workers() -> Option<&'static ID3D12CommandQueue> {
                     })
                     .ok()?
             };
-            for n in 0..2 {
+            // Detiling and snapshot reads run alongside the title's recording
+            // threads; scale conservatively on CPUs with fewer logical cores.
+            let count = std::thread::available_parallelism().map_or(2, |n| (n.get() / 5).clamp(2, 4));
+            for n in 0..count {
                 let worker = Worker::new(&host.device, queue.clone()).ok()?;
                 std::thread::Builder::new().name(format!("uploads ahead {n}")).spawn(move || worker.work()).ok()?;
             }
@@ -415,3 +457,4 @@ mod tests {
         }
     }
 }
+
