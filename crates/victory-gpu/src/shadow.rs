@@ -3104,24 +3104,13 @@ impl Shadow {
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
         // been refreshed since, and keeps the bytes taken then).
-        let mut parts = vec![self.inside(address, len)];
-        for &(a, e) in pending.iter() {
-            let (a, e) = self.inside(a, e - a);
-            let mut rest = Vec::with_capacity(parts.len() + 1);
-            for (from, to) in parts {
-                if e <= from || a >= to {
-                    rest.push((from, to));
-                    continue;
-                }
-                if from < a {
-                    rest.push((from, a));
-                }
-                if e < to {
-                    rest.push((e, to));
-                }
-            }
-            parts = rest;
-        }
+        let (from, to) = self.inside(address, len);
+        let overlaps = pending.iter()
+            .filter(|&&(a, e)| a < address + len && e > address)
+            .map(|&(a, e)| self.inside(a, e - a))
+            .filter(|&(a, e)| a < e)
+            .collect();
+        let parts = outside(from, to, overlaps);
         pending.push(range);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
