@@ -624,7 +624,7 @@ pub(crate) fn save(now: bool) {
     };
     // Through `used`: a process that asked for none yet (`victory shaders`)
     // must not write the earlier runs' list over with nothing.
-    let used: Vec<String> = used().iter().flatten().cloned().collect();
+    let used: Vec<String> = used().read().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // New stores may have landed since serialisation. Only retire the
@@ -755,21 +755,19 @@ pub(crate) fn note_time(key: &str, ms: u64) {
 }
 
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
-static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 
-fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
-    let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
-    if used.is_none() {
+fn used() -> &'static RwLock<HashSet<String>> {
+    static USED: OnceLock<RwLock<HashSet<String>>> = OnceLock::new();
+    USED.get_or_init(|| {
         let listed = DIR
             .get()
             .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
             .unwrap_or_default();
         let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
         tracing::info!(pipelines = set.len(), "title pipelines to start early");
-        *used = Some(set);
-    }
-    used
+        RwLock::new(set)
+    })
 }
 
 /// Whether the title pipeline with `key` was requested in this or an earlier run.
@@ -782,14 +780,21 @@ pub(crate) fn wanted_early(key: &str) -> bool {
     if *ALL.get_or_init(|| std::env::var_os("VICTORY_EARLY_ALL").is_some_and(|v| v == "1")) {
         return true;
     }
-    used().as_ref().is_some_and(|s| s.contains(key))
+    used().read().unwrap_or_else(|e| e.into_inner()).contains(key)
 }
 
 /// A draw or dispatch requested the title pipeline with `key`.
 pub(crate) fn note_used(key: &str) {
-    let mut used = used();
-    let set = used.get_or_insert_with(HashSet::new);
-    if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
+    let used = used();
+    {
+        let set = used.read().unwrap_or_else(|e| e.into_inner());
+        if set.len() >= EARLY_MAX || set.contains(key) {
+            return;
+        }
+    }
+    let mut set = used.write().unwrap_or_else(|e| e.into_inner());
+    if set.len() < EARLY_MAX && !set.contains(key) {
+        set.insert(key.to_owned());
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
 }
