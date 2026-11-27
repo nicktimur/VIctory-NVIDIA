@@ -1569,18 +1569,19 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
             }
         }
     }
+    // Build the page masks before taking the journal lock shared by landing workers.
+    let mut blocks: Vec<(usize, u16)> = Vec::with_capacity(spans.len());
+    for &page in pages {
+        let (block, part) = (page / PARTS, 1u16 << (page % PARTS));
+        match blocks.last_mut() {
+            Some((last, parts)) if *last == block => *parts |= part,
+            _ => blocks.push((block, part)),
+        }
+    }
     {
         let mut j = journal_mut();
         let now = next_asking();
         noted = now;
-        let mut blocks: Vec<(usize, u16)> = Vec::with_capacity(spans.len());
-        for &page in pages {
-            let (block, part) = (page / PARTS, 1u16 << (page % PARTS));
-            match blocks.last_mut() {
-                Some((last, parts)) if *last == block => *parts |= part,
-                _ => blocks.push((block, part)),
-            }
-        }
         for (block, parts) in blocks {
             before.push((block, j.note(block, parts, now)));
         }
