@@ -41,18 +41,24 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 static STAGING_SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
-/// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
+/// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), [`SPARE`]
+/// below budget otherwise, and zero at or above budget.
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
     STAGING_SPARES.store(staging_spares(crate::host::available_physical_ram(), crate::host::keep_freed()), Ordering::Relaxed);
     // Drop empty upload blocks promptly when the PC is under RAM pressure;
     // they are system-memory caches and do not follow the VRAM budget.
-    lock(&STAGING).rested(now());
+    let now = now();
+    lock(&STAGING).rested(now);
+    // A full budget can stop new texture allocations, which would
+    // otherwise be the callers that reap these blocks.
+    lock(&TEXTURES).rested(now);
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     match memory {
+        Some([budget, used, ..]) if budget != 0 && used >= budget => 0,
         Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
         _ => SPARE,
     }
@@ -574,6 +580,8 @@ mod tests {
     fn empty_blocks_stay_while_the_card_has_room() {
         assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
         assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([100, 100, 0, 0]), true), 0);
+        assert_eq!(spares(Some([100, 110, 0, 0]), false), 0);
         assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
     }

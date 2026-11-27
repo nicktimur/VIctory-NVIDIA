@@ -241,6 +241,21 @@ fn give_back(index: usize, runs: &[(u32, u32)]) {
     }
 }
 
+/// Drop fully free heaps when Windows reports no more local budget.
+pub(crate) fn trim_empty(memory: Option<[u64; 4]>) {
+    if !memory.is_some_and(|[budget, used, ..]| budget != 0 && used >= budget) {
+        return;
+    }
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    for heap in &mut *pool {
+        if heap.as_ref().is_some_and(|h| h.free_tiles == HEAP_TILES) {
+            *heap = None;
+            STATS[3].fetch_sub(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
+            STATS[8].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// What is given so far to one texture.
 struct Given {
     /// Per level with tiles of its own: whether it has them.
@@ -1458,6 +1473,12 @@ void look() {
         if the_view_starts_at_the_first_level_with_tiles(&mut rig).is_none() {
             eprintln!("the view test's shader or objects could not be made; that part was skipped");
         }
+        let allocated = STATS[3].load(Ordering::Relaxed);
+        assert_ne!(allocated, 0, "one empty heap is normally retained");
+        trim_empty(Some([100, 99, 0, 0]));
+        assert_eq!(STATS[3].load(Ordering::Relaxed), allocated);
+        trim_empty(Some([100, 100, 0, 0]));
+        assert_eq!(STATS[3].load(Ordering::Relaxed), 0);
         rig.step = "the end";
         rig.check("every step done");
         eprintln!(

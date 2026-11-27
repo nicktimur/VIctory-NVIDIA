@@ -436,7 +436,9 @@ fn sweep() {
     }
     #[cfg(feature = "diagnostics")]
     crate::book::check();
-    crate::pool::room(host().and_then(|h| h.video_memory()));
+    let memory = host().and_then(|h| h.video_memory());
+    crate::pool::room(memory);
+    crate::tiles::trim_empty(memory);
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
