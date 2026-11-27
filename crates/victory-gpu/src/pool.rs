@@ -45,8 +45,9 @@ static STAGING_SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// below budget otherwise, and zero at or above budget.
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
-    SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
-    STAGING_SPARES.store(staging_spares(crate::host::available_physical_ram(), crate::host::keep_freed()), Ordering::Relaxed);
+    let keep_spares = crate::host::keep_freed() && !crate::host::memory_headroom();
+    SPARES.store(spares(memory, keep_spares), Ordering::Relaxed);
+    STAGING_SPARES.store(staging_spares(crate::host::available_physical_ram(), keep_spares), Ordering::Relaxed);
     // Drop empty upload blocks promptly when the PC is under RAM pressure;
     // they are system-memory caches and do not follow the VRAM budget.
     let now = now();

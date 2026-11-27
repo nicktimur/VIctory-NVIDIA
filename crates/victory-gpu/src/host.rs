@@ -157,12 +157,13 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(88) {
+    let (start, urgent, target) = if memory_headroom() { (82, 90, 78) } else { (88, 95, 85) };
+    if used < share(start) {
         (KEPT_MS, u64::MAX)
-    } else if used < share(95) {
-        (IDLE_MS, used - share(85))
+    } else if used < share(urgent) {
+        (IDLE_MS, used - share(target))
     } else {
-        (SHORT_MS, used - share(85))
+        (SHORT_MS, used - share(target))
     }
 }
 
@@ -367,12 +368,18 @@ pub(crate) fn keep_freed() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_FREED").is_none_or(|v| v != "0"))
 }
 
+/// The NVIDIA launcher keeps more memory available for the title and OS.
+pub(crate) fn memory_headroom() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_HEADROOM").is_some_and(|v| v == "1"))
+}
+
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
 /// buffers, loose shadows, and the mapped pipeline library), scaled down
 /// when free physical RAM is low. Never returns less than 2,000 ms.
 /// With plenty of it five minutes ([`keep_freed`]).
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
-    ram_idle_for(avail_phys, keep_freed())
+    ram_idle_for(avail_phys, keep_freed() && !memory_headroom())
 }
 
 fn ram_idle_for(avail_phys: Option<u64>, keep: bool) -> u64 {
@@ -1990,6 +1997,7 @@ fn scratch_spare_limit() -> u64 {
                 Some(_) | None => SPARE_KEPT,
             }
         };
+        let limit = if memory_headroom() { limit.min(256 * MIB) } else { limit };
         LIMIT.store(limit, Ordering::Relaxed);
     }
     LIMIT.load(Ordering::Relaxed)
@@ -8753,7 +8761,7 @@ impl Meter {
     }
 
     /// Counts a presented frame.
-    fn frame(&mut self, hwnd: HWND) {
+    fn frame(&mut self, host: &Host, hwnd: HWND) {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
@@ -8879,6 +8887,10 @@ impl Meter {
                 "host present cadence"
             );
             self.logged = now;
+            if let Some(free) = available_physical_ram() {
+                tracing::info!(available_mib = free >> 20, "system RAM headroom");
+            }
+            host.log_video_memory("during gameplay");
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
@@ -9210,7 +9222,7 @@ impl Host {
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
-            p.meter.frame(p.hwnd);
+            p.meter.frame(self, p.hwnd);
             showing.end();
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));

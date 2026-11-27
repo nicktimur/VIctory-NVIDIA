@@ -50,6 +50,8 @@ $settings = @{
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'
     # Large streamed textures take card memory mip by mip; avoids reserving full chains before they arrive.
     VICTORY_LEVELS_ON_DEMAND = '1'
+    # Leave room for active resources, Windows, and other processes.
+    VICTORY_MEMORY_HEADROOM = '1'; VICTORY_TEXTURE_ROOM_PERCENT = '80'
     # During world loading, map pages side by side while mapping is the bottleneck; return to one caller when it is not.
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = 'auto'; VICTORY_TITLE_PRIORITIES = '1'; VICTORY_CARD_AWAKE = '1'
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'; VICTORY_SKIP_PIPELINES = 'none'
@@ -172,7 +174,8 @@ try {
         if ($LASTEXITCODE -eq 0) { $log.WriteLine("Checkout: $head") }
     }
     foreach ($name in 'VICTORY_TEXTURE_NO_WAIT', 'VICTORY_UPLOAD_AHEAD', 'VICTORY_LEVELS_ON_DEMAND',
-        'VICTORY_SUBMIT_FRAMES', 'VICTORY_CARD_BUFFERS_MB', 'VICTORY_PIPELINE_WAIT_MS', 'VICTORY_WINDOWS_BAR_MB') {
+        'VICTORY_SUBMIT_FRAMES', 'VICTORY_CARD_BUFFERS_MB', 'VICTORY_PIPELINE_WAIT_MS', 'VICTORY_WINDOWS_BAR_MB',
+        'VICTORY_MEMORY_HEADROOM', 'VICTORY_TEXTURE_ROOM_PERCENT') {
         if ($settings.ContainsKey($name)) { $log.WriteLine("$name=$($settings[$name])") }
     }
     if ($prepareShaders) {
