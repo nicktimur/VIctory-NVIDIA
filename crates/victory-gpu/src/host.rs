@@ -1087,6 +1087,11 @@ mod tests {
                 let there = from < 0x1_1000 || (0x3_0000..0x4_0000).contains(&from);
                 assert_eq!(b, if there { 0x5a } else { 0 }, "byte {from:#x}");
             }
+            // A saved mapping should produce the same bytes in a reused buffer.
+            let mut reused = vec![0x99; out.len()];
+            let runs = [(at.add(0x300) as usize, 0x1_1000 - 0x300), (at.add(0x3_0000) as usize, 0x1_0000)];
+            assert_eq!(super::read_there_in_runs(at.add(0x300), &mut reused, &runs), 0x1_1000 - 0x300 + 0x1_0000);
+            assert_eq!(reused, out);
             // All there: one read.
             let mut out = vec![0x77u8; 0x1_0000];
             assert_eq!(super::read_there(at.add(0x1000), &mut out), 0x1_0000);
@@ -8400,28 +8405,35 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// reads). What the runtime's record says is mapped is read in one go each,
 /// and by pieces where that fails; memory it has no record of by pieces.
 pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
-    dst.fill(0);
-    let (start, len) = (src as usize, dst.len());
+    let runs = crate::inplace::shown_runs(src as usize, dst.len());
+    read_there_in_runs(src, dst, &runs)
+}
+
+/// Reads using the ordered, clipped runs returned by `inplace::shown_runs`.
+/// With no recorded runs, probe the entire span as before.
+pub(crate) fn read_there_in_runs(src: *const u8, dst: &mut [u8], runs: &[(usize, usize)]) -> usize {
+    let start = src as usize;
+    let whole = [(start, dst.len())];
+    let runs = if runs.is_empty() { &whole } else { runs };
     let mut got = 0;
-    let mut runs = crate::inplace::shown_runs(start, len);
-    if runs.is_empty() {
-        runs.push((start, len));
-    }
-    for (at, n) in runs {
-        let piece = &mut dst[at - start..at - start + n];
+    let mut covered = 0;
+    for &(at, n) in runs {
+        let offset = at - start;
+        dst[covered..offset].fill(0);
+        covered = offset + n;
+        let piece = &mut dst[offset..covered];
         if read_into(at as *const u8, piece) {
             got += n;
             continue;
         }
-        // (What failed may have written its first pages.)
-        piece.fill(0);
+        // A failed read can have written a prefix. The smaller reads
+        // overwrite the entire run, zeroing only pages they cannot read.
         for_pieces(at, n, 64 << 10, |from, n| {
             let piece = &mut dst[from - start..from - start + n];
             if read_into(from as *const u8, piece) {
                 got += n;
                 return;
             }
-            piece.fill(0);
             for_pieces(from, n, 4 << 10, |from, n| {
                 let piece = &mut dst[from - start..from - start + n];
                 if read_into(from as *const u8, piece) {
@@ -8432,6 +8444,7 @@ pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
             });
         });
     }
+    dst[covered..].fill(0);
     got
 }
 

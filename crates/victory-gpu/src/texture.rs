@@ -1452,7 +1452,7 @@ impl Staging {
         let mut got = 0;
         let complete = before & 1 == 0 && with_read(size, |read| {
             let mapped_before = crate::inplace::shown_runs(start as usize, size);
-            got = crate::host::read_there(self.memory, read);
+            got = crate::host::read_there_in_runs(self.memory, read, &mapped_before);
             if got == 0 || (got as u64) < self.expected.load(Relaxed) || before != crate::watch::changes() {
                 return false;
             }
