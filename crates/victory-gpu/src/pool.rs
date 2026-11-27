@@ -47,7 +47,8 @@ static STAGING_SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     let keep_spares = crate::host::keep_freed() && !crate::host::memory_headroom();
     SPARES.store(spares(memory, keep_spares), Ordering::Relaxed);
-    STAGING_SPARES.store(staging_spares(crate::host::available_physical_ram(), keep_spares), Ordering::Relaxed);
+    let staging = staging_spares(crate::host::available_physical_ram(), keep_spares);
+    STAGING_SPARES.store(staging, Ordering::Relaxed);
     // Drop empty upload blocks promptly when the PC is under RAM pressure;
     // they are system-memory caches and do not follow the VRAM budget.
     let now = now();
@@ -67,10 +68,10 @@ fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
 
 fn staging_spares(available: Option<u64>, keep: bool) -> usize {
     const GIB: u64 = 1024 * 1024 * 1024;
-    if keep && available.is_some_and(|bytes| bytes >= 12 * GIB) {
-        STAGING_KEPT
-    } else {
-        SPARE
+    match available {
+        Some(bytes) if bytes < 6 * GIB => 0,
+        Some(bytes) if keep && bytes >= 12 * GIB => STAGING_KEPT,
+        _ => SPARE,
     }
 }
 
@@ -585,6 +586,16 @@ mod tests {
         assert_eq!(spares(Some([100, 110, 0, 0]), false), 0);
         assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
+    }
+
+    #[test]
+    fn empty_upload_blocks_follow_system_ram_headroom() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(staging_spares(Some(6 * GIB - 1), false), 0);
+        assert_eq!(staging_spares(Some(6 * GIB), false), SPARE);
+        assert_eq!(staging_spares(Some(6 * GIB - 1), true), 0);
+        assert_eq!(staging_spares(Some(12 * GIB), true), STAGING_KEPT);
+        assert_eq!(staging_spares(None, false), SPARE);
     }
 
     #[test]
