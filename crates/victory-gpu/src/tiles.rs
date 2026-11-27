@@ -131,17 +131,12 @@ pub(crate) fn given_total() -> u64 {
 struct Heap {
     heap: ID3D12Heap,
     free: Vec<(u32, u32)>,
+    free_tiles: u32,
 }
 
 // SAFETY: a heap of the device, named only in queue and device calls, which
 // any thread may make; its free runs are plain numbers behind `POOL`'s lock.
 unsafe impl Send for Heap {}
-
-impl Heap {
-    fn free_tiles(&self) -> u32 {
-        self.free.iter().map(|run| run.1).sum()
-    }
-}
 
 /// The pool's heaps by place; a place is empty after its heap went back to
 /// the card (a texture names its heaps by place).
@@ -156,7 +151,7 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
         return None;
     }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let found = pool.iter().position(|h| h.as_ref().is_some_and(|h| h.free_tiles() >= count));
+    let found = pool.iter().position(|h| h.as_ref().is_some_and(|h| h.free_tiles >= count));
     let index = match found {
         Some(index) => index,
         None => {
@@ -178,6 +173,7 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
             let fresh = Heap {
                 heap: made?,
                 free: vec![(0, HEAP_TILES)],
+                free_tiles: HEAP_TILES,
             };
             STATS[3].fetch_add(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
             match pool.iter().position(Option::is_none) {
@@ -195,17 +191,24 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
     let h = pool[index].as_mut()?;
     let mut runs = Vec::new();
     let mut left = count;
-    while left > 0 {
-        let &(start, tiles) = h.free.first()?;
-        let part = tiles.min(left);
-        runs.push((start, part));
-        if part == tiles {
-            h.free.remove(0);
-        } else {
-            h.free[0] = (start + part, tiles - part);
-        }
+    let mut consumed = 0;
+    for (start, tiles) in &mut h.free {
+        let part = (*tiles).min(left);
+        runs.push((*start, part));
         left -= part;
+        if part == *tiles {
+            consumed += 1;
+        } else {
+            *start += part;
+            *tiles -= part;
+        }
+        if left == 0 {
+            break;
+        }
     }
+    debug_assert_eq!(left, 0);
+    h.free.drain(..consumed);
+    h.free_tiles -= count;
     Some((h.heap.clone(), index, runs))
 }
 
@@ -219,17 +222,18 @@ fn give_back(index: usize, runs: &[(u32, u32)]) {
     let Some(Some(h)) = pool.get_mut(index) else {
         return;
     };
+    h.free_tiles += runs.iter().map(|&(_, tiles)| tiles).sum::<u32>();
     h.free.extend_from_slice(runs);
     h.free.sort_unstable();
-    let mut joined: Vec<(u32, u32)> = Vec::with_capacity(h.free.len());
-    for &(from, tiles) in &h.free {
-        match joined.last_mut() {
-            Some(last) if last.0 + last.1 == from => last.1 += tiles,
-            _ => joined.push((from, tiles)),
+    h.free.dedup_by(|next, previous| {
+        if previous.0 + previous.1 == next.0 {
+            previous.1 += next.1;
+            true
+        } else {
+            false
         }
-    }
-    h.free = joined;
-    let all_free = h.free_tiles() == HEAP_TILES;
+    });
+    let all_free = h.free_tiles == HEAP_TILES;
     if all_free && pool.iter().flatten().count() > 1 {
         pool[index] = None;
         STATS[3].fetch_sub(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
