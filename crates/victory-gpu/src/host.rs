@@ -8800,9 +8800,9 @@ impl Meter {
             if through + left + filled > 0.0 {
                 tracing::info!(
                     "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
-                     {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there), \
-                     {filled:.1} first fillings from the pages there (VICTORY_TEXTURE_FILL=0: left empty), {short:.1} of them \
-                     with less than was mapped (looked at again)"
+                     {through:.1} read through the kernel, {left:.1} full reads deferred (unreadable or remapped), \
+                     {filled:.1} first-fill attempts (VICTORY_TEXTURE_FILL=0: off), {short:.1} of them \
+                     deferred (incomplete or changing mapping)"
                 );
             }
         }

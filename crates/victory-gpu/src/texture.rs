@@ -1408,14 +1408,15 @@ impl Staging {
         // Reject it if the mapping epoch changed; the next refresh retries
         // without blocking the render path.
         let before = crate::watch::changes();
-        let mapped_before = crate::inplace::shown_runs(self.memory as usize, size);
-        let read = with_read(size, |read| {
+        let read = before & 1 == 0 && with_read(size, |read| {
+            let mapped_before = crate::inplace::shown_runs(self.memory as usize, size);
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            let after = crate::watch::changes();
-            let mapped_after = crate::inplace::shown_runs(self.memory as usize, size);
-            if before != after || after & 1 != 0 || mapped_before != mapped_after {
+            if before != crate::watch::changes()
+                || mapped_before != crate::inplace::shown_runs(self.memory as usize, size)
+                || before != crate::watch::changes()
+            {
                 return false;
             }
             let hash = digest(read);
@@ -1445,37 +1446,25 @@ impl Staging {
     fn fill(&self, last: &mut Last, size: usize) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let start = self.memory as u64;
-        let mut there = 0;
-        let complete = with_read(size, |read| {
-            let mut complete = false;
-            for _ in 0..4 {
-                let before = crate::watch::changes();
-                if before & 1 != 0 {
-                    crate::watch::change_over();
-                    continue;
-                }
-                let mapped_before = crate::inplace::shown_runs(start as usize, size);
-                let got = crate::host::read_there(self.memory, read) as u64;
-                there = mapped_bytes(self.memory, size);
-                let after = crate::watch::changes();
-                let mapped_after = crate::inplace::shown_runs(start as usize, size);
-                if before != after || after & 1 != 0 || mapped_before != mapped_after {
-                    crate::watch::change_over();
-                    continue;
-                }
-                if there != 0 && got == there && got >= self.expected.load(Relaxed) {
-                    complete = true;
-                    break;
-                }
-                crate::watch::change_over();
+        // Retry through the descriptor queue, next use, or copy worker.
+        // Polling here would stall submission for each texture in a remap.
+        let before = crate::watch::changes();
+        let mut got = 0;
+        let complete = before & 1 == 0 && with_read(size, |read| {
+            let mapped_before = crate::inplace::shown_runs(start as usize, size);
+            got = crate::host::read_there(self.memory, read);
+            if got == 0 || (got as u64) < self.expected.load(Relaxed) || before != crate::watch::changes() {
+                return false;
             }
-            // read_there zero-fills absent pages. Do not detile a partial or
-            // mixed-epoch snapshot: it would publish holes over valid texels.
-            if complete {
-                last.hash = Some(digest(read));
-                self.detile(read);
+            if got as u64 != mapped_bytes(self.memory, size)
+                || mapped_before != crate::inplace::shown_runs(start as usize, size)
+                || before != crate::watch::changes()
+            {
+                return false;
             }
-            complete
+            last.hash = Some(digest(read));
+            self.detile(read);
+            true
         });
         last.partial = Some(crate::frame::current());
         UNLOCKED[2].fetch_add(1, Relaxed);
@@ -1486,7 +1475,7 @@ impl Staging {
         } else {
             crate::descriptor::host::read_all(start);
         }
-        size
+        got
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
