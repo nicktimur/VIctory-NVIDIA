@@ -49,11 +49,18 @@ pub(crate) struct Job {
     staging: Arc<Staging>,
     copy: Arc<HostTexture>,
     asked: std::time::Instant,
+    retries: AtomicU64,
     /// What to do when it has run; `None`: it has.
     then: Mutex<Option<Vec<Box<dyn FnOnce() + Send>>>>,
 }
 
 impl Job {
+    /// Backs off repeatedly unreadable snapshots without abandoning them.
+    fn retry_delay(&self) -> std::time::Duration {
+        let attempt = self.retries.fetch_add(1, Relaxed).min(4);
+        std::time::Duration::from_millis(8 << attempt)
+    }
+
     /// Calls `f` when the copy has run: now if it has.
     pub(crate) fn then(&self, f: impl FnOnce() + Send + 'static) {
         let mut then = self.then.lock().unwrap_or_else(|e| e.into_inner());
@@ -171,7 +178,13 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     if super::no_wait() && super::fill_unlocked() {
         staging.expected.store(if there == u64::MAX { super::mapped_bytes(staging.memory, staging.read) } else { there }, Relaxed);
     }
-    let job = Arc::new(Job { staging, copy, asked: std::time::Instant::now(), then: Mutex::new(Some(Vec::new())) });
+    let job = Arc::new(Job {
+        staging,
+        copy,
+        asked: std::time::Instant::now(),
+        retries: AtomicU64::new(0),
+        then: Mutex::new(Some(Vec::new())),
+    });
     ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner()).push((job.copy.serial, job.clone()));
     Some(Taken::New(job))
 }
@@ -272,18 +285,44 @@ impl Worker {
                     jobs.push(job);
                 }
             }
-            value += 1;
-            if let Err(e) = self.copy(&jobs, value) {
-                tracing::warn!(error = %e, "uploads ahead did not run");
+            let mut ready = Vec::with_capacity(jobs.len());
+            let mut pending = Vec::new();
+            let mut retry_after = std::time::Duration::ZERO;
+            for job in jobs {
+                job.staging.refresh();
+                if job.staging.ready.load(Relaxed) {
+                    job.retries.store(0, Relaxed);
+                    ready.push(job);
+                } else {
+                    retry_after = retry_after.max(job.retry_delay());
+                    pending.push(job);
+                }
             }
-            finish(jobs);
+            if !pending.is_empty() {
+                // A remap can make a nonblocking snapshot incomplete. Keep
+                // ownership and retry; never publish the pooled buffer's old
+                // bytes as this texture.
+                std::thread::sleep(retry_after);
+                QUEUE.0.lock().unwrap_or_else(|e| e.into_inner()).extend(pending);
+                QUEUE.1.notify_all();
+            }
+            if ready.is_empty() {
+                continue;
+            }
+            value += 1;
+            if let Err(e) = self.copy(&ready, value) {
+                tracing::warn!(error = %e, "uploads ahead did not run");
+                let delay = ready.iter().map(|job| job.retry_delay()).max().unwrap_or_default();
+                std::thread::sleep(delay);
+                QUEUE.0.lock().unwrap_or_else(|e| e.into_inner()).extend(ready);
+                QUEUE.1.notify_all();
+                continue;
+            }
+            finish(ready);
         }
     }
 
     fn copy(&self, jobs: &[Arc<Job>], value: u64) -> windows::core::Result<()> {
-        for job in jobs {
-            job.staging.refresh();
-        }
         // SAFETY: this worker's allocator and list, whose last submission has
         // run; the jobs hold what the list names until after the wait.
         unsafe {
