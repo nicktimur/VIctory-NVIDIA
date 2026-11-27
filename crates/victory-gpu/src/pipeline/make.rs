@@ -37,6 +37,8 @@ pub(crate) struct Pending {
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
+    /// Wakes draws waiting for this pipeline when a worker finishes it.
+    finished: (Mutex<()>, Condvar),
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
     key: String,
@@ -76,6 +78,7 @@ impl Pending {
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
             made: OnceLock::new(),
+            finished: (Mutex::new(()), Condvar::new()),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
             waited_us: AtomicU64::new(0),
@@ -93,7 +96,7 @@ impl Pending {
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
         });
-        let (lock, done) = &DONE;
+        let (lock, done) = &self.finished;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
@@ -127,9 +130,6 @@ pub(crate) fn hashes(p: &Pending) -> String {
     let hashes: Vec<&str> = p.shaders.iter().map(|s| s.hash.as_str()).collect();
     hashes.join("+")
 }
-
-/// Signalled whenever a worker has made a pipeline.
-static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 /// Waiting allowed per title frame, over all threads.
 fn wait_budget() -> Duration {
@@ -309,7 +309,7 @@ fn wait(p: &Pending, frame: u64) {
         return;
     }
     let started = Instant::now();
-    let (lock, done) = &DONE;
+    let (lock, done) = &p.finished;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
         let rest = left.saturating_sub(started.elapsed());
