@@ -111,10 +111,7 @@ pub(crate) fn translation() -> [u8; 32] {
 /// can do decides the form of some programs.
 pub fn precompile(container: &[u8]) -> Result<bool, String> {
     let _ = crate::host::host();
-    let misses = MISSES.load(Ordering::Relaxed);
-    host_shader(container)?;
-    // (Counts other threads' misses too: the caller only adds them up.)
-    Ok(MISSES.load(Ordering::Relaxed) == misses)
+    host_shader(container).map(|(_, cache_hit)| cache_hit)
 }
 
 /// The translation of a console shader container, from the cache when
