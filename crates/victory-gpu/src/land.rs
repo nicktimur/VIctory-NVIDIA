@@ -290,21 +290,26 @@ impl Pool {
     fn help(&self) {
         let mut state = self.state();
         loop {
-            let Some((work, i)) = take(&mut state) else {
+            let Some((work, jobs)) = take(&mut state, self.threads) else {
                 state = self.more.wait(state).unwrap_or_else(|e| e.into_inner());
                 continue;
             };
             state.running += 1;
             drop(state);
-            let working = crate::timeline::span("a landing's job");
-            // SAFETY: counted in `running`, so `each` has not returned.
-            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));
-            working.end();
+            let mut panicked = false;
+            for i in jobs {
+                let working = crate::timeline::span("a landing's job");
+                // SAFETY: this batch is counted in `running`, so `each`
+                // has not returned.
+                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));
+                working.end();
+                panicked |= ran.is_err();
+            }
             state = self.state();
             state.running -= 1;
-            state.panicked |= ran.is_err();
-            if state.running == 0 {
-                self.idle.notify_all();
+            state.panicked |= panicked;
+            if state.running == 0 && state.work.is_none() {
+                self.idle.notify_one();
             }
         }
     }
@@ -331,8 +336,8 @@ impl Pool {
         }
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loop {
-                let Some((_, i)) = take(&mut self.state()) else { break };
-                f(i);
+                let Some((_, jobs)) = take(&mut self.state(), self.threads) else { break };
+                jobs.for_each(f);
             }
         }));
         let mut state = self.state();
@@ -350,14 +355,18 @@ impl Pool {
     }
 }
 
-/// The next number of the batch, if there is one.
-fn take(state: &mut State) -> Option<(Work, usize)> {
+/// Claim several jobs when there is a backlog, then taper to one job
+/// so longer copies near the end can still be spread across workers.
+fn take(state: &mut State, threads: usize) -> Option<(Work, std::ops::Range<usize>)> {
     let work = state.work?;
-    if state.next >= state.count {
+    let remaining = state.count - state.next;
+    if remaining == 0 {
         return None;
     }
-    state.next += 1;
-    Some((work, state.next - 1))
+    let count = (remaining / (threads * 4)).clamp(1, 4);
+    let start = state.next;
+    state.next += count;
+    Some((work, start..state.next))
 }
 
 /// [`Pool::each`] on the threads kept for landing.
