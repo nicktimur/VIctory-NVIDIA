@@ -507,7 +507,9 @@ fn read_sync_pages(
     mut visit: impl FnMut(usize, usize, &[u8]),
 ) {
     let mut bytes = Vec::new();
-    for run in pages.chunk_by(|a, b| a.1 == b.0) {
+    // Four 64 KiB pages bound the temporary buffer to 256 KiB per worker.
+    const READ_PAGES: usize = 4;
+    for run in pages.chunk_by(|a, b| a.1 == b.0).flat_map(|run| run.chunks(READ_PAGES)) {
         let start = run[0].0;
         let end = run.last().unwrap().1;
         bytes.resize(end - start, 0);
