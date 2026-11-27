@@ -42,12 +42,19 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
     if sgd5::is_sgd5(data) {
         out.extend(sgd5::records(data).map(Source::Packed));
     }
-    let raw = memchr::memmem::find_iter(data, b"DXBC")
-        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
-        .map(|offset| Source::Raw {
+    let raw = memchr::memmem::find_iter(data, b"DXBC").filter_map(|offset| {
+        let tail = &data[offset..];
+        // `Container::parse` checks that the declared length fits in this
+        // tail. Keep only the container: hashing the remaining file bytes
+        // made one shader appear unique at every occurrence and polluted
+        // both the dedup set and the persistent translation cache.
+        Container::parse(tail).ok()?;
+        let len = u32::from_le_bytes(tail.get(0x18..0x1c)?.try_into().ok()?) as usize;
+        Some(Source::Raw {
             offset,
-            data: &data[offset..],
-        });
+            data: tail.get(..len)?,
+        })
+    });
     out.extend(raw);
     out
 }
