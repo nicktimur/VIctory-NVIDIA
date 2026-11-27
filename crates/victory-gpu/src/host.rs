@@ -772,7 +772,6 @@ pub(crate) static ALIVE: [std::sync::atomic::AtomicU64; 8] = [const { std::sync:
 pub(crate) static LISTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// The process's working set and commit, in bytes.
-#[cfg(feature = "diagnostics")]
 fn process_memory() -> Option<[u64; 2]> {
     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -8955,7 +8954,6 @@ impl Meter {
             if let Some(free) = available_physical_ram() {
                 tracing::info!(available_mib = free >> 20, "system RAM headroom");
             }
-            #[cfg(feature = "diagnostics")]
             if let Some([working_set, commit]) = process_memory() {
                 tracing::info!(
                     working_set_mib = working_set >> 20,
